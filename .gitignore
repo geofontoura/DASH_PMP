@@ -1,0 +1,6 @@
+# dados de entrada (shapefiles + banco de poços) ficam locais -- repo público
+2_Banco_de_Dados/
+src/.cache/
+__pycache__/
+# saídas geradas (publicadas nos repos VIEW3D_PMP / VIEW2D_PMP / MAPS_PMP)
+src/*.html
