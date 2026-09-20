@@ -4,3 +4,5 @@ pandas
 scipy
 shapely
 plotly
+pillow
+pyproj

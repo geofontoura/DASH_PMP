@@ -255,6 +255,12 @@ def carregar_furos_recorte():
     for col in df.columns:
         if col.startswith("Alt_topo_") or col in ("E", "N"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
+        elif col.startswith("Prof_topo_") or col in ("Cota_boca", "Profundidade"):
+            # texto tipo "165m"/"299,76" -- extrai o número (mesmo tratamento do dashboard)
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(",", ".", regex=False).str.extract(r"(-?\d+\.?\d*)")[0],
+                errors="coerce",
+            )
     dentro = pontos_dentro_poligono(df["E"].to_numpy(), df["N"].to_numpy(), poligono)
     return df[dentro].reset_index(drop=True)
 
@@ -778,3 +784,235 @@ def adicionar_escala_e_norte(fig, x_min, x_max, y_min, y_max, row=None, col=None
                         showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=2, arrowcolor=cor, text="")
     fig.add_annotation(x=norte_x, y=norte_y1 + (y_max - y_min) * 0.025, xref=xref, yref=yref,
                         text="N", showarrow=False, font=dict(size=13, color=cor))
+
+
+# =====================================================================
+# Camadas compartilhadas pelo webmap e pelo dashboard (Leaflet) -- mesma
+# estrutura do Taió (gerar_webmap_taio.py / gerar_dashboard_geoquimico.py),
+# só que alimentada com os dados do PMP: retângulo area2.shp, curvas3.shp,
+# Litologia_PMP2.shp e os furos de sondagem dentro do retângulo.
+# =====================================================================
+import io
+import json
+
+# cor por SIGLA_UNID (Litologia_PMP2.shp). CPRM oficial só onde há bate exato
+# na biblioteca de estilo (ver nota em CORES_ESTILIZADO + NP3_gamma_pc, que
+# também bateu exato); as demais são cores PROVISÓRIAS, sem símbolo CPRM
+# equivalente encontrado.
+COR_POR_SIGLA = {
+    "P23rr": CORES_ESTILIZADO["Fm_RioDoRasto"], "P2t": CORES_ESTILIZADO["Fm_Teresina"],
+    "P2sa": CORES_ESTILIZADO["Fm_SerraAlta"], "P1i": CORES_ESTILIZADO["Fm_Irati"],
+    "P1p": CORES_ESTILIZADO["Fm_Palermo"], "P1rb": CORES_ESTILIZADO["Fm_RioBonito"],
+    "C2P1t": CORES_ESTILIZADO["Fm_Taciba"],
+    "K1sg": "#6F8F72", "K1bt": "#E6B86A", "K1_beta_vs": "#9A7FA6",   # provisórias
+    "NP3_gamma_pc": "#FF2014",                                          # CPRM exato (255,32,20)
+    "Q2apa": "#F2E6A0", "Q2ca": "#D9CB82",                              # provisórias
+    "K1sg_delta_m": CORES_ESTILIZADO["Gp_SerraGeral"],
+    "K1sg_delta_nv": CORES_ESTILIZADO["Gp_SerraGeral"],
+    "K1sg_delta_u": CORES_ESTILIZADO["Gp_SerraGeral"],
+}
+COR_LITOLOGIA_PADRAO = "#CCCCCC"
+
+# unidade mais profunda atingida pelo furo (jovem -> antigo), a partir de Prof_topo_*
+ORDEM_PROFUNDIDADE_FURO = [
+    ("Cenozoico", "Cenozoico", "#D9CB82"),
+    ("sbGp_EstradaNova", "Estrada Nova (Teresina/Serra Alta)", CORES_ESTILIZADO["Fm_Teresina"]),
+    ("Fm_Irati", "Irati", CORES_ESTILIZADO["Fm_Irati"]),
+    ("Fm_Palermo", "Palermo", "#9FB4C4"),
+    ("Fm_RioBonito", "Rio Bonito", "#8A9AA3"),
+    ("Gp_Itarare", "Itararé (Taciba)", "#C9BDB4"),
+    ("Embasamento", "Embasamento", "#4A4A4A"),
+]
+COR_FURO_SEM_TOPO = "#999999"
+ROTULO_FURO_SEM_TOPO = "Sem topo estratigráfico"
+
+CORES_HIPSOMETRICAS = ["#4F9AA8", "#9FC1A3", "#D8C88C", "#C6924A", "#A66A2C"]  # mesma rampa do Taió
+
+LEAFLET_LINKS = """<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>"""
+
+# basemaps (tiles reais, precisam de internet) -- MESMOS 5 do webmap do Taió.
+# String simples (não f-string): as chaves {z}/{x}/{y} são do Leaflet.
+JS_BASEMAPS = """
+    var satelite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+        attribution: 'Esri World Imagery', maxZoom: 19,
+    });
+    var rico = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; OpenStreetMap &copy; CARTO', maxZoom: 20, subdomains: 'abcd',
+    });
+    var escuro = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; OpenStreetMap &copy; CARTO', maxZoom: 20, subdomains: 'abcd',
+    });
+    var osmPadrao = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors', maxZoom: 19,
+    });
+    var relevo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors, SRTM &copy; OpenTopoMap (CC-BY-SA)',
+        maxZoom: 17, subdomains: 'abc',
+    });
+"""
+
+
+def _hex_rgb(hex_cor):
+    h = hex_cor.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _para_wgs84(gdf):
+    return gdf.to_crs(4326) if gdf.crs is not None else gdf.set_crs(31982).to_crs(4326)
+
+
+def _geojson_leve(gdf):
+    """GeoJSON dict com coordenadas arredondadas a ~1 m (1e-5 grau) -- corta
+    bastante o peso do HTML sem perda visível."""
+    gdf = gdf.copy()
+    gdf["geometry"] = [shapely.set_precision(g, 1e-5) if g is not None and not g.is_empty else g for g in gdf.geometry]
+    return json.loads(gdf.to_json())
+
+
+def gerar_hipsometria_leaflet(resolucao=700):
+    """PNG RGBA (base64) hipsométrico + hillshade da topografia real
+    (curvas3.shp) pra L.imageOverlay -- mesma técnica/rampa do webmap do
+    Taió. A grade é amostrada DIRETO em lon/lat (transformada pra UTM pra
+    consultar o terreno) e recortada pelo retângulo, então cai certo sobre os
+    tiles (o retângulo em UTM não é alinhado a lat/lon, o que entortaria uma
+    imagem gerada em UTM). Devolve (png_b64, [[lat_min, lon_min], [lat_max, lon_max]], (zmin, zmax))."""
+    from PIL import Image
+    from pyproj import Transformer
+
+    poligono, (e0, n0, e1, n1) = carregar_area_pmp()
+    xt, yt, zt = carregar_vertices_curvas_pmp()
+    interp = construir_interpolador(xt, yt, zt)
+    to_wgs = Transformer.from_crs("EPSG:31982", "EPSG:4326", always_xy=True)
+    to_utm = Transformer.from_crs("EPSG:4326", "EPSG:31982", always_xy=True)
+    cantos = [to_wgs.transform(x, y) for x, y in [(e0, n0), (e0, n1), (e1, n0), (e1, n1)]]
+    lon_min, lon_max = min(c[0] for c in cantos), max(c[0] for c in cantos)
+    lat_min, lat_max = min(c[1] for c in cantos), max(c[1] for c in cantos)
+
+    lons = np.linspace(lon_min, lon_max, resolucao)
+    lats = np.linspace(lat_max, lat_min, resolucao)  # linha 0 = norte
+    glon, glat = np.meshgrid(lons, lats)
+    gx, gy = to_utm.transform(glon.ravel(), glat.ravel())
+    gx, gy = np.asarray(gx).reshape(glon.shape), np.asarray(gy).reshape(glon.shape)
+    dentro = pontos_dentro_poligono(gx, gy, poligono)
+    gz = avaliar_interpolador(interp, gx.ravel(), gy.ravel(), raio_mascara_km=3.0).reshape(gx.shape)
+    dentro &= ~np.isnan(gz)
+
+    zmin, zmax = float(np.nanmin(gz[dentro])), float(np.nanmax(gz[dentro]))
+    t = np.clip((np.nan_to_num(gz, nan=zmin) - zmin) / (zmax - zmin), 0, 1)
+    paleta = np.array([_hex_rgb(c) for c in CORES_HIPSOMETRICAS], dtype=float)
+    n_trechos = len(paleta) - 1
+    pos = t * n_trechos
+    idx = np.clip(pos.astype(int), 0, n_trechos - 1)
+    rgb = paleta[idx] + (paleta[idx + 1] - paleta[idx]) * (pos - idx)[..., None]
+
+    # hillshade (sol NO 315°, 45°) -- espaçamento real em metros
+    lat_c = (lat_min + lat_max) / 2
+    dy_m = (lat_max - lat_min) / (resolucao - 1) * 110_574.0
+    dx_m = (lon_max - lon_min) / (resolucao - 1) * 111_320.0 * np.cos(np.radians(lat_c))
+    dzdy, dzdx = np.gradient(np.nan_to_num(gz, nan=zmin), -dy_m, dx_m)
+    slope = np.arctan(np.hypot(dzdx, dzdy))
+    aspect = np.arctan2(-dzdx, dzdy)
+    az, alt = np.radians(360.0 - 315.0 + 90.0), np.radians(45.0)
+    sombra = np.clip(np.sin(alt) * np.cos(slope) + np.cos(alt) * np.sin(slope) * np.cos(az - aspect), 0, 1)
+    rgb = np.clip(rgb * (0.45 + 0.65 * sombra)[..., None], 0, 255).astype(np.uint8)
+
+    rgba = np.dstack([rgb, np.where(dentro, 255, 0).astype(np.uint8)])
+    buf = io.BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("ascii"), [[lat_min, lon_min], [lat_max, lon_max]], (zmin, zmax)
+
+
+def preparar_geologia_leaflet():
+    """Devolve (geojson_formacoes, geojson_sills, itens_legenda_formacoes) em
+    WGS84 -- 'categoria' = NOME_UNIDA (chave da legenda item a item)."""
+    gdf = carregar_litologia_pmp()
+    gdf["cor"] = gdf["SIGLA_UNID"].map(COR_POR_SIGLA).fillna(COR_LITOLOGIA_PADRAO)
+    gdf["area_km2"] = gdf.geometry.area / 1e6
+    gdf["categoria"] = gdf["NOME_UNIDA"]
+    gdf["popup"] = gdf.apply(lambda r: (
+        f"<b>{r['NOME_UNIDA']}</b><br>{r['SIGLA_UNID']} · {r['HIERARQUIA']}<br>"
+        f"Área do polígono: {r['area_km2']:.2f} km²"), axis=1)
+    eh_sill = gdf["SIGLA_UNID"].isin(SIGLAS_SILL_INDIVIDUALIZADO)
+    cols = ["SIGLA_UNID", "categoria", "cor", "popup", "geometry"]
+    formacoes = _para_wgs84(gdf.loc[~eh_sill, cols])
+    sills = gdf.loc[eh_sill, cols].copy()
+    sills["categoria"] = "Sill — " + sills["categoria"]
+    sills["popup"] = ("<b>Sill — " + gdf.loc[eh_sill, "NOME_UNIDA"] + "</b><br>Corpo intrusivo mapeado (Gp. Serra Geral)<br>Área: "
+                      + gdf.loc[eh_sill, "area_km2"].map("{:.2f} km²".format))
+    sills = _para_wgs84(sills)
+    itens = (gdf.loc[~eh_sill].drop_duplicates("NOME_UNIDA").sort_values("area_km2", ascending=False)
+             [["NOME_UNIDA", "cor"]].rename(columns={"NOME_UNIDA": "label"}).to_dict("records"))
+    return _geojson_leve(formacoes), _geojson_leve(sills), itens
+
+
+def preparar_curvas_leaflet(passo_m=50, tolerancia_m=8.0):
+    """Curvas de nível mestras (múltiplos de `passo_m`) em WGS84, simplificadas."""
+    gdf = gpd.read_file(CURVAS_PMP_SHP).to_crs("EPSG:31982")
+    gdf = gdf[(gdf["ELEV"] % passo_m) == 0].copy()
+    gdf["geometry"] = gdf.geometry.simplify(tolerancia_m)
+    gdf["categoria"] = "Curva de nível (%dm)" % passo_m
+    gdf["popup"] = gdf["ELEV"].map(lambda v: f"Cota {v:.0f} m")
+    return _geojson_leve(_para_wgs84(gdf[["ELEV", "categoria", "popup", "geometry"]]))
+
+
+def preparar_contorno_area_leaflet():
+    poligono, _ = carregar_area_pmp()
+    gdf = gpd.GeoDataFrame({"popup": ["Área de estudo (area2.shp)"], "categoria": ["Área de estudo"]},
+                           geometry=[poligono], crs=31982)
+    return _geojson_leve(_para_wgs84(gdf))
+
+
+def _intervalos_corpo(s):
+    import re
+    if pd.isna(s):
+        return []
+    return [(float(a), float(b)) for a, b in re.findall(r"\(([\d.]+)\s*,\s*([\d.]+)\)", str(s))]
+
+
+def preparar_furos():
+    """Furos dentro do retângulo como DataFrame pronto pra tabela/mapa/gráficos:
+    id, nome, unidade mais profunda atingida (rótulo/cor), corpo intrusivo
+    (intervalo mais espesso -> espessura medida em furo) e lat/lon."""
+    from pyproj import Transformer
+    f = carregar_furos_recorte().copy()
+    f["id"] = ["F%03d" % i for i in range(len(f))]
+
+    def nome_tipo(r):
+        for c in ("Cod_poco", "Poco", "Codigo"):
+            v = r.get(c)
+            if pd.notna(v) and str(v).strip():
+                return str(v).strip(), "Furo"
+        # sem código de furo: são pontos de campo (ex.: "Soleira / corte de estrada")
+        v = r.get("Afloramento")
+        txt = str(v).strip()[:40] if pd.notna(v) and str(v).strip() else "Afloramento s/ nome"
+        return txt, "Afloramento"
+    nt = f.apply(nome_tipo, axis=1)
+    f["nome"] = [x[0] for x in nt]
+    f["tipo"] = [x[1] for x in nt]
+    # ordem: furos primeiro (nome em ordem natural), depois afloramentos
+    f = f.sort_values(["tipo", "nome"], key=lambda c: c.str.lower() if c.name == "nome" else c).reset_index(drop=True)
+    f["id"] = ["F%03d" % i for i in range(len(f))]
+
+    def mais_profunda(r):
+        atual = (ROTULO_FURO_SEM_TOPO, COR_FURO_SEM_TOPO)
+        for col, rot, cor in ORDEM_PROFUNDIDADE_FURO:
+            if pd.notna(r.get(f"Prof_topo_{col}")):
+                atual = (rot, cor)
+        return atual
+    par = f.apply(mais_profunda, axis=1)
+    f["unidade_fundo"] = [p[0] for p in par]
+    f["cor"] = [p[1] for p in par]
+
+    f["esp_corpo_m"] = f["Prof_corpos_intrusivos_SG"].map(
+        lambda s: max((b - a for a, b in _intervalos_corpo(s)), default=np.nan))
+    f["n_corpos"] = f["Prof_corpos_intrusivos_SG"].map(lambda s: len(_intervalos_corpo(s)))
+    f["corpo_intervalos"] = f["Prof_corpos_intrusivos_SG"].map(
+        lambda s: "; ".join(f"{a:.1f}–{b:.1f} m" for a, b in _intervalos_corpo(s)))
+
+    to_wgs = Transformer.from_crs("EPSG:31982", "EPSG:4326", always_xy=True)
+    lon, lat = to_wgs.transform(f["E"].to_numpy(), f["N"].to_numpy())
+    f["lon"], f["lat"] = np.round(lon, 6), np.round(lat, 6)
+    return f
