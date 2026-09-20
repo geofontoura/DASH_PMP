@@ -37,7 +37,7 @@ from _comum_pmp import (
     CORES_ESTILIZADO, ESPESSURA_ESTILIZADO_M, ESPESSURA_SILL_M, ORDEM_PROFUNDIDADE_FURO,
     COR_FURO_SEM_TOPO, ROTULO_FURO_SEM_TOPO, LEAFLET_LINKS, JS_BASEMAPS, logo_base64,
     gerar_hipsometria_leaflet, preparar_geologia_leaflet, preparar_contorno_area_leaflet, preparar_furos,
-    carregar_litologia_pmp, SIGLAS_SILL_INDIVIDUALIZADO,
+    carregar_litologia_pmp, SIGLAS_SILL_INDIVIDUALIZADO, _intervalos_corpo,
 )
 
 BASE = Path(__file__).resolve().parent
@@ -136,6 +136,18 @@ def montar_graficos(f):
     fh = f.copy()
     fh["hover"] = fh.apply(lambda r: f"<b>{r['nome']}</b><br>{r.get('Municipio') if pd.notna(r.get('Municipio')) else '—'}<br>{r['unidade_fundo']}", axis=1)
 
+    # 0. coluna estratigráfica do(s) furo(s) selecionado(s) -- desenhada no navegador
+    # (JS: desenharColuna); aqui só o quadro vazio com a mensagem inicial
+    fig = go.Figure()
+    fig.add_annotation(text="Selecione um furo (lista, mapa ou gráfico) ou clique numa barra de<br>"
+                            "\"Furos por fonte\" para ver a coluna estratigráfica", x=0.5, y=0.5, xref="paper", yref="paper",
+                       showarrow=False, font=dict(size=13, color=MARCA_CINZA_CLARO), opacity=0.7)
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+    tema_grafico(fig, "Coluna estratigráfica", 480)
+    fig.update_layout(height=None, autosize=True)
+    graficos["coluna"] = fig
+
     # 1. profundidade x cota da boca (clicável -> sincroniza com lista/mapa)
     d = fh.dropna(subset=["Profundidade", "Cota_boca"])
     fig = go.Figure(go.Scatter(
@@ -169,7 +181,8 @@ def montar_graficos(f):
     fig = go.Figure(go.Bar(x=fonte.values, y=fonte.index, orientation="h", marker=dict(color=MARCA_ROXO),
                            hovertemplate="%{y}: %{x} furos<extra></extra>"))
     fig.update_xaxes(title_text="Nº de furos")
-    graficos["fontes"] = tema_grafico(fig, "Furos por fonte (planilha/camada de origem)", max(280, 90 + 18 * len(fonte)))
+    graficos["fontes"] = tema_grafico(fig, "Furos por fonte (planilha/camada de origem)", max(280, 90 + 18 * len(fonte)),
+                                      "clique numa barra: mostra todos os furos da fonte lado a lado na coluna")
 
     # 5. unidade mais profunda atingida
     ordem = [r for _, r, _ in ORDEM_PROFUNDIDADE_FURO] + [ROTULO_FURO_SEM_TOPO]
@@ -180,7 +193,8 @@ def montar_graficos(f):
     fig = go.Figure(go.Bar(x=rot, y=[int(cont[r]) for r in rot], marker=dict(color=[cores[r] for r in rot], line=dict(width=1, color=MARCA_NAVY)),
                            text=[int(cont[r]) for r in rot], textposition="outside", hovertemplate="%{x}: %{y} furos<extra></extra>"))
     fig.update_yaxes(title_text="Nº de furos")
-    graficos["unidade-fundo"] = tema_grafico(fig, "Unidade mais profunda atingida pelo furo", 300, "a partir dos topos estratigráficos medidos (Prof_topo_*)")
+    graficos["unidade-fundo"] = tema_grafico(fig, "Unidade mais profunda atingida pelo furo", 300,
+                                             "topos medidos (Prof_topo_*) · clique numa barra p/ ver esses furos na coluna")
 
     # 6. profundidade do topo de cada unidade
     fig = go.Figure()
@@ -284,6 +298,14 @@ TEMPLATE = r"""<!DOCTYPE html>
   #mapa-leaflet { flex: 1; }
   .col-graficos { overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 12px; }
   .grafico-card { background: var(--painel); border: 1px solid var(--borda-fraca); border-left: 4px solid @@ROXO@@; border-radius: 8px; flex-shrink: 0; }
+  .card-coluna { display: flex; flex-direction: column; height: calc(100vh - 134px); min-height: 480px; }
+  .coluna-ctrl { display: flex; align-items: center; gap: 8px; padding: 8px 12px 0 14px; font-size: 12px; }
+  .btn-mini { background: transparent; color: var(--texto); border: 1px solid @@ROXO@@; border-radius: 5px; padding: 3px 9px; font-family: @@FONTE@@; font-size: 11px; cursor: pointer; opacity: 0.6; }
+  .btn-mini.ativo { opacity: 1; background: @@ROXO@@; color: #fff; }
+  #grupo-info { margin-left: auto; font-size: 11px; opacity: 0.85; }
+  #grupo-info button { margin-left: 6px; }
+  .col-plot { flex: 1; min-height: 0; overflow-x: auto; overflow-y: hidden; }
+  .col-plot > div, .col-plot .plotly-graph-div { height: 100% !important; }
   .leaflet-popup-content-wrapper { background: @@ROXO_ESCURO@@; color: @@CINZA@@; border: 1px solid @@ROXO@@; }
   .leaflet-popup-tip { background: @@ROXO_ESCURO@@; }
   .leaflet-popup-content { font-family: @@FONTE@@; font-size: 12px; }
@@ -367,8 +389,12 @@ TEMPLATE = r"""<!DOCTYPE html>
         if (!gd) return;
         gd.on('plotly_click', function(ev) {
             var pt = ev.points && ev.points[0];
-            if (!pt || pt.customdata === undefined || pt.customdata === null) return;
-            selecionarPorId(pt.customdata, 'grafico');
+            if (!pt) return;
+            // barras de "Furos por fonte" / "Unidade mais profunda" -> todos os furos do grupo, lado a lado
+            if (gd.id === 'grafico-fontes') { selecionarGrupo('fonte', String(pt.y)); return; }
+            if (gd.id === 'grafico-unidade-fundo') { selecionarGrupo('unidade', String(pt.x)); return; }
+            if (pt.customdata === undefined || pt.customdata === null) return;
+            selecionarPorId(pt.customdata, gd.id === 'grafico-coluna' ? 'coluna' : 'grafico');
         });
     });
 
@@ -395,6 +421,7 @@ TEMPLATE = r"""<!DOCTYPE html>
         escuro: { paper: '@@NAVY@@', painel: '@@PAINEL@@', texto: '@@CINZA@@', grid: '#3a3f52', legendBg: 'rgba(45,10,74,0.75)' },
         claro:  { paper: '@@CINZA@@', painel: '#FFFFFF', texto: '@@NAVY@@', grid: '#D8D8E2', legendBg: 'rgba(255,255,255,0.85)' },
     };
+    var temaAtual = 'escuro';
     function temaPlotly(gd, nome) {
         if (!gd || !gd.layout) return;
         var t = TEMA[nome];
@@ -410,6 +437,153 @@ TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById('btn-tema-escuro').classList.toggle('ativo', nome === 'escuro');
         document.getElementById('btn-tema-claro').classList.toggle('ativo', nome === 'claro');
         TODOS_GD.forEach(function(gd) { temaPlotly(gd, nome); });
+        temaAtual = nome;
+        desenharColuna();
+    };
+
+    // ---- coluna estratigráfica (1ª janela): 1 furo, ou todos os furos de um grupo lado a lado ----
+    var modoColuna = { tipo: 'vazio' };     // {tipo:'furo', id} | {tipo:'grupo', ids:[...], titulo}
+    var eixoColuna = 'prof';                // 'prof' (profundidade) | 'elev' (cota da boca - profundidade)
+    var selecionadoId = null;
+    var LARG_LITO = 0.62, DESL_CORPO = 0.42, LARG_CORPO = 0.2, COR_CORPO = '#A63D2F';
+
+    function fmt0(v) { return Math.round(v).toString(); }
+    window.mudarEixoColuna = function(eixo) {
+        eixoColuna = eixo;
+        document.getElementById('eixo-prof').classList.toggle('ativo', eixo === 'prof');
+        document.getElementById('eixo-elev').classList.toggle('ativo', eixo === 'elev');
+        desenharColuna();
+    };
+
+    function desenharColuna() {
+        var gd = document.getElementById('grafico-coluna');
+        if (!gd || modoColuna.tipo === 'vazio') return;
+        var t = TEMA[temaAtual];
+        var ids = modoColuna.tipo === 'furo' ? [modoColuna.id] : modoColuna.ids;
+        var regs = ids.map(function(id) { return DADOS_POR_ID[id]; });
+        var usaElev = eixoColuna === 'elev';
+        var omitidos = 0;
+        if (usaElev) {
+            var comCota = regs.filter(function(r) { return r.cota !== null; });
+            omitidos = regs.length - comCota.length;
+            regs = comCota;
+        }
+        var traces = [], vistos = {}, legendaGrupos = {};
+        var multi = regs.length > 1;
+        var comTexto = regs.length <= 6;
+
+        regs.forEach(function(r, i) {
+            var c = r.coluna;
+            var conv = usaElev ? function(d) { return r.cota - d; } : function(d) { return d; };
+            var nUnid = 0;
+            c.tops.forEach(function(tp, k) {
+                var ini = tp.t;
+                var fim = (k + 1 < c.tops.length) ? c.tops[k + 1].t : ((r.prof !== null && r.prof > ini) ? r.prof : null);
+                if (fim === null || fim <= ini) return;
+                nUnid++;
+                var a = conv(ini), b = conv(fim);
+                traces.push({
+                    type: 'bar', x: [i], y: [b - a], base: [a], width: [LARG_LITO], name: tp.n,
+                    legendgroup: tp.n, showlegend: !vistos[tp.n], customdata: [r.id],
+                    marker: { color: tp.c, line: { color: t.texto, width: 0.6 } },
+                    text: comTexto ? [tp.s + '<br>' + fmt0(ini) + '–' + fmt0(fim) + ' m'] : [''],
+                    textposition: 'inside', insidetextanchor: 'middle', textfont: { color: tp.tc, size: 10 },
+                    hovertemplate: '<b>' + r.nome + '</b><br>' + tp.n + '<br>' + fmt0(ini) + '–' + fmt0(fim) + ' m de profundidade'
+                                   + (r.cota !== null ? ' (cota ' + fmt0(r.cota - ini) + ' → ' + fmt0(r.cota - fim) + ' m)' : '')
+                                   + '<extra></extra>',
+                });
+                vistos[tp.n] = true;
+            });
+            if (nUnid === 0 && r.prof !== null) {   // furo sem topos medidos: coluna cinza "sem topos"
+                var a0 = conv(0), b0 = conv(r.prof);
+                traces.push({
+                    type: 'bar', x: [i], y: [b0 - a0], base: [a0], width: [LARG_LITO], name: 'Sem topos medidos',
+                    legendgroup: 'sem', showlegend: !vistos['sem'], customdata: [r.id],
+                    marker: { color: '#6b6f80', line: { color: t.texto, width: 0.6 }, pattern: { shape: '/', fgcolor: '#999' } },
+                    hovertemplate: '<b>' + r.nome + '</b><br>sem topos estratigráficos medidos<br>0–' + fmt0(r.prof) + ' m<extra></extra>',
+                });
+                vistos['sem'] = true;
+            }
+            c.corpos.forEach(function(cp) {
+                var a = conv(cp[0]), b = conv(cp[1]);
+                traces.push({
+                    type: 'bar', x: [i + DESL_CORPO], y: [b - a], base: [a], width: [LARG_CORPO], name: 'Corpo intrusivo',
+                    legendgroup: 'corpo', showlegend: !vistos['corpo'], customdata: [r.id],
+                    marker: { color: COR_CORPO, line: { color: '#000', width: 0.6 } },
+                    hovertemplate: '<b>' + r.nome + '</b><br>Corpo intrusivo ' + cp[0].toFixed(1) + '–' + cp[1].toFixed(1)
+                                   + ' m (' + (cp[1] - cp[0]).toFixed(1) + ' m)<extra></extra>',
+                });
+                vistos['corpo'] = true;
+            });
+        });
+
+        var n = regs.length;
+        var shapes = [];
+        regs.forEach(function(r, i) {   // moldura no furo selecionado
+            if (r.id === selecionadoId && multi) {
+                shapes.push({ type: 'rect', xref: 'x', yref: 'paper', x0: i - 0.44, x1: i + 0.6, y0: 0, y1: 1, layer: 'below',
+                              line: { color: '@@ROXO@@', width: 2 }, fillcolor: 'rgba(123,47,255,0.10)' });
+            }
+        });
+        var titulo, sub;
+        if (modoColuna.tipo === 'furo') {
+            var r0 = DADOS_POR_ID[modoColuna.id];
+            titulo = 'Coluna do furo ' + r0.nome;
+            sub = [r0.municipio, r0.cota !== null ? 'cota ' + fmt0(r0.cota) + ' m' : null,
+                   r0.prof !== null ? 'prof. ' + fmt0(r0.prof) + ' m' : null, 'fonte ' + r0.fonte].filter(Boolean).join(' · ');
+        } else {
+            titulo = modoColuna.titulo;
+            sub = ids.length + ' furos · clique numa coluna para destacar' + (usaElev && omitidos ? ' · ' + omitidos + ' sem cota omitidos' : '');
+        }
+        var layout = {
+            barmode: 'overlay', bargap: 0, paper_bgcolor: t.paper, plot_bgcolor: t.painel,
+            font: { family: '@@FONTE@@', color: t.texto, size: 11 }, autosize: true,
+            title: { text: '<b>' + titulo + '</b><br><span style="font-size:11px;opacity:.7">' + sub + '</span>', x: 0.02, font: { size: 13, color: t.texto } },
+            margin: { l: 62, r: 20, t: 135, b: multi ? 95 : 50 },
+            xaxis: { tickmode: 'array', tickvals: regs.map(function(r, i) { return i + 0.1; }), ticktext: regs.map(function(r) { return r.nome; }),
+                     tickangle: multi ? -60 : 0, tickfont: { size: n > 14 ? 8 : 10 }, range: [-0.6, n - 0.25],
+                     showgrid: false, zeroline: false, color: t.texto },
+            yaxis: usaElev ? { title: 'Elevação (m)', gridcolor: t.grid, zerolinecolor: t.grid, color: t.texto }
+                           : { title: 'Profundidade (m)', autorange: 'reversed', gridcolor: t.grid, zerolinecolor: t.grid, color: t.texto },
+            legend: { orientation: 'h', y: 1.01, yanchor: 'bottom', x: 0, xanchor: 'left', bgcolor: 'rgba(0,0,0,0)', font: { size: 10, color: t.texto } },
+            shapes: shapes,
+        };
+        if (n > 12) layout.width = n * 44 + 140;   // muitas colunas: largura fixa + rolagem horizontal
+        Plotly.react(gd, traces, layout, { responsive: true });
+    }
+
+    // ---- grupos (clique numa barra de fonte/unidade) ----
+    var filtroIds = null;   // Set de ids visíveis na lista, ou null
+    var grupoLayer = null;
+    function atualizarInfoGrupo() {
+        var el = document.getElementById('grupo-info');
+        el.innerHTML = filtroIds ? (modoColuna.titulo + ' <button class="btn-mini ativo" onclick="limparGrupo()">limpar ✕</button>') : '';
+    }
+    function selecionarGrupo(tipo, chave) {
+        var pred = tipo === 'fonte' ? function(r) { return r.fonte === chave; } : function(r) { return r.unidade === chave; };
+        var regs = DADOS.filter(pred);
+        if (!regs.length) return;
+        regs.sort(function(a, b) { return a.nome.localeCompare(b.nome, undefined, { numeric: true }); });
+        filtroIds = new Set(regs.map(function(r) { return r.id; }));
+        modoColuna = { tipo: 'grupo', ids: regs.map(function(r) { return r.id; }),
+                       titulo: (tipo === 'fonte' ? 'Fonte ' : 'Unidade mais profunda: ') + chave };
+        if (selecionadoId && !filtroIds.has(selecionadoId)) selecionadoId = null;
+        desenharColuna();
+        atualizarInfoGrupo();
+        aplicarFiltro();
+        if (grupoLayer) mapa.removeLayer(grupoLayer);
+        grupoLayer = L.layerGroup(regs.map(function(r) {
+            return L.circleMarker([r.lat, r.lon], { radius: 10, color: '@@ROXO@@', weight: 2.5, fillOpacity: 0, interactive: false });
+        })).addTo(mapa);
+        mapa.flyToBounds(L.latLngBounds(regs.map(function(r) { return [r.lat, r.lon]; })), { padding: [40, 40], maxZoom: 14, duration: 0.6 });
+    }
+    window.limparGrupo = function() {
+        filtroIds = null;
+        if (grupoLayer) { mapa.removeLayer(grupoLayer); grupoLayer = null; }
+        modoColuna = selecionadoId ? { tipo: 'furo', id: selecionadoId } : { tipo: 'vazio' };
+        if (modoColuna.tipo === 'furo') desenharColuna();
+        atualizarInfoGrupo();
+        aplicarFiltro();
     };
 
     // ---- mapa Leaflet ----
@@ -474,8 +648,14 @@ TEMPLATE = r"""<!DOCTYPE html>
         atualizarDestaqueGraficos(id);
         var r = DADOS_POR_ID[id];
         if (!r) return;
+        selecionadoId = id;
+        // se o furo pertence ao grupo aberto, mantém as colunas lado a lado e só destaca; senão mostra o furo sozinho
+        if (!(modoColuna.tipo === 'grupo' && filtroIds && filtroIds.has(id))) modoColuna = { tipo: 'furo', id: id };
+        desenharColuna();
+        atualizarInfoGrupo();
         destaqueMapa.setLatLng([r.lat, r.lon]);
         destaqueMapa.setStyle({ opacity: 1 });
+        if (origem === 'init') return;
         if (origem !== 'mapa') mapa.flyTo([r.lat, r.lon], Math.max(mapa.getZoom(), 14), { duration: 0.6 });
     }
     document.getElementById('corpo-tabela').addEventListener('click', function(ev) {
@@ -516,7 +696,8 @@ TEMPLATE = r"""<!DOCTYPE html>
     function aplicarFiltro() {
         var termo = document.getElementById('busca').value.toLowerCase(), vis = 0;
         document.querySelectorAll('.linha-dado').forEach(function(el) {
-            var mostra = !termo || el.getAttribute('data-busca').indexOf(termo) !== -1;
+            var mostra = (!termo || el.getAttribute('data-busca').indexOf(termo) !== -1)
+                         && (!filtroIds || filtroIds.has(el.getAttribute('data-id')));
             el.style.display = mostra ? '' : 'none';
             if (mostra) vis++;
         });
@@ -524,6 +705,10 @@ TEMPLATE = r"""<!DOCTYPE html>
     }
     document.getElementById('busca').addEventListener('input', aplicarFiltro);
     aplicarFiltro();
+
+    // abre já com um furo de exemplo (o com mais unidades medidas) pra coluna não começar vazia
+    var inicial = DADOS.slice().sort(function(a, b) { return b.coluna.tops.length - a.coluna.tops.length; })[0];
+    if (inicial) selecionarPorId(inicial.id, 'init');
 })();
 </script>
 </body>
@@ -551,6 +736,20 @@ def main():
                 partes.append(f"{rot.split(' (')[0]} {v:.0f}")
         return " · ".join(partes)
 
+    def luminancia_txt(hexcor):
+        h = hexcor.lstrip("#")
+        r_, g_, b_ = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+        return "#1B1F2E" if (0.299 * r_ + 0.587 * g_ + 0.114 * b_) > 150 else "#F2F2F2"
+
+    def coluna_furo(r):
+        tops = []
+        for col, rot, cor in ORDEM_PROFUNDIDADE_FURO:
+            v = r.get(f"Prof_topo_{col}")
+            if pd.notna(v):
+                tops.append(dict(n=rot, s=rot.split(" (")[0], t=float(v), c=cor, tc=luminancia_txt(cor)))
+        tops.sort(key=lambda x: x["t"])
+        return dict(tops=tops, corpos=[[a, b] for a, b in _intervalos_corpo(r.get("Prof_corpos_intrusivos_SG"))])
+
     dados, feats, linhas = [], [], []
     for _, r in f.iterrows():
         nf = lambda v: None if pd.isna(v) else float(v)
@@ -562,6 +761,7 @@ def main():
             cota=nf(r["Cota_boca"]), prof=nf(r["Profundidade"]), unidade=r["unidade_fundo"], cor=r["cor"],
             topos=topos_txt(r), corpo=r["corpo_intervalos"] or None, fonte=str(r["fonte_planilha"]),
             x=float(r["E"]), y=float(r["N"]), lat=float(r["lat"]), lon=float(r["lon"]),
+            coluna=coluna_furo(r),
         )
         dados.append(reg)
         feats.append({"type": "Feature", "geometry": {"type": "Point", "coordinates": [reg["lon"], reg["lat"]]},
@@ -582,9 +782,20 @@ def main():
     leg_furos = [[r, c] for r, c in ordem_leg if r in presentes]
 
     ids = list(graficos.keys())
-    cards = "\n".join(
-        f'    <div class="grafico-card">{pio.to_html(fig, full_html=False, include_plotlyjs=False, div_id="grafico-" + k, config={"responsive": True})}</div>'
-        for k, fig in graficos.items())
+    def card(k, fig):
+        plot = pio.to_html(fig, full_html=False, include_plotlyjs=False, div_id="grafico-" + k, config={"responsive": True})
+        if k == "coluna":
+            return f'''    <div class="grafico-card card-coluna">
+      <div class="coluna-ctrl">
+        <span>Eixo:</span>
+        <button class="btn-mini ativo" id="eixo-prof" onclick="mudarEixoColuna('prof')">Profundidade</button>
+        <button class="btn-mini" id="eixo-elev" onclick="mudarEixoColuna('elev')">Elevação</button>
+        <span id="grupo-info"></span>
+      </div>
+      <div class="col-plot">{plot}</div>
+    </div>'''
+        return f'    <div class="grafico-card">{plot}</div>'
+    cards = "\n".join(card(k, fig) for k, fig in graficos.items())
     j = lambda o: json.dumps(o, ensure_ascii=False, separators=(",", ":"))
     logo = logo_base64()
 
