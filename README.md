@@ -16,8 +16,9 @@ Este repo também guarda o código que gera os produtos web do PMP a partir de `
 ```
 pip install -r requirements.txt
 cd src
-python gerar_cubo_pmp.py       # cubo 3D   -> VIEW3D_PMP
-python gerar_secao_pmp.py      # seção     -> VIEW2D_PMP
-python gerar_mapa_web_pmp.py   # webmap    -> MAPS_PMP
-python gerar_dashboard_pmp.py  # dashboard -> este repo (index.html)
+python gerar_cubo_pmp.py       # modelo 3D   -> VIEW3D_PMP (index.html)
+python gerar_secao_pmp.py      # seção 2D    -> VIEW2D_PMP (index.html)
+python gerar_mapa_web_pmp.py   # webmap      -> MAPS_PMP   (index.html)
+python gerar_dashboard_pmp.py  # dashboard   -> este repo  (index.html)
 ```
+O satélite (Esri World Imagery) é baixado uma vez e fica em `src/.cache/`.

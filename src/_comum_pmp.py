@@ -1016,3 +1016,51 @@ def preparar_furos():
     lon, lat = to_wgs.transform(f["E"].to_numpy(), f["N"].to_numpy())
     f["lon"], f["lat"] = np.round(lon, 6), np.round(lat, 6)
     return f
+
+
+# =====================================================================
+# Satélite (Esri World Imagery) reprojetado pro retângulo -- usado como
+# modo de cor do 3D e como fundo do mapa da seção, igual aos modos
+# "Satélite" dos apps do Taió (mesma técnica: contextily + reprojeção).
+# Baixa os tiles UMA vez (rede) e cacheia em .cache/ -- apagar o .npy força
+# baixar de novo. IMAGEM DE TERCEIROS: atribuição "Esri World Imagery";
+# confira os termos da Esri antes de uso comercial/redistribuição.
+# =====================================================================
+SATELITE_ZOOM = 14
+SATELITE_RES_M = 23.0  # metros por pixel do raster UTM cacheado
+
+
+def obter_satelite_utm():
+    """Raster RGB uint8 (3, H, W) do satélite no retângulo, em UTM 22S
+    (linha 0 = norte), + (e_min, n_min, e_max, n_max)."""
+    from rasterio.transform import from_bounds
+    from rasterio.warp import Resampling, reproject
+    from shapely.geometry import box
+
+    _, (e0, n0, e1, n1) = carregar_area_pmp()
+    w_px, h_px = int(round((e1 - e0) / SATELITE_RES_M)), int(round((n1 - n0) / SATELITE_RES_M))
+    CACHE_DIR.mkdir(exist_ok=True)
+    cache = CACHE_DIR / f"satelite_z{SATELITE_ZOOM}_{w_px}x{h_px}.npy"
+    if cache.exists():
+        return np.load(cache), (e0, n0, e1, n1)
+
+    import contextily as ctx
+    print("Baixando satélite Esri World Imagery (uma vez, fica em cache)...")
+    w, s, e, n = gpd.GeoDataFrame(geometry=[box(e0, n0, e1, n1)], crs="EPSG:31982").to_crs("EPSG:4326").total_bounds
+    img, ext = ctx.bounds2img(w, s, e, n, ll=True, zoom=SATELITE_ZOOM, source=ctx.providers.Esri.WorldImagery, n_connections=8)
+    src_t = from_bounds(ext[0], ext[2], ext[1], ext[3], img.shape[1], img.shape[0])
+    dst_t = from_bounds(e0, n0, e1, n1, w_px, h_px)
+    dst = np.zeros((3, h_px, w_px), dtype=np.uint8)
+    reproject(source=np.moveaxis(img[:, :, :3], -1, 0), destination=dst, src_transform=src_t, src_crs="EPSG:3857",
+              dst_transform=dst_t, dst_crs="EPSG:31982", resampling=Resampling.bilinear)
+    np.save(cache, dst)
+    return dst, (e0, n0, e1, n1)
+
+
+def amostrar_satelite_rgb(raster, bounds, xs, ys):
+    """Cor RGB (N,3 uint8) do raster de satélite nos pontos (xs, ys) em UTM."""
+    e0, n0, e1, n1 = bounds
+    _, h, w = raster.shape
+    col = np.clip(((np.asarray(xs) - e0) / (e1 - e0) * (w - 1)).round().astype(int), 0, w - 1)
+    row = np.clip(((n1 - np.asarray(ys)) / (n1 - n0) * (h - 1)).round().astype(int), 0, h - 1)
+    return np.stack([raster[0, row, col], raster[1, row, col], raster[2, row, col]], axis=-1)

@@ -6,3 +6,5 @@ shapely
 plotly
 pillow
 pyproj
+rasterio
+contextily

@@ -1,36 +1,42 @@
-"""Gera a seção interativa do caso PMP -- reconstruída do zero, SEM NENHUM
-dado de poço (nem banco de dados de poço, nem interpolação de poço) -- só
-area.shp/curvas.shp/Litologia_PMP.shp, igual ao cubo estilizado
-(gerar_cubo_estilizado_pmp.py, mesmos planos por formação, ver
-_comum_pmp.py::calcular_planos_estilizados).
+"""Seção 2D interativa do PMP -- mesmas funcionalidades do app de seção do
+Taió (gerar_secao_interativa.py), com os dados do PMP:
 
-Um modo só (mais simples que a versão anterior, que tinha 3 modos e
-dependia de poço): mapa em planta (hipsometria ou geologia real) + perfil,
-com 4 ângulos de corte e posição por slider ou clique direto no mapa --
-mesma técnica do gerar_secao_interativa.py do Taió.
+  - mapa em planta clicável + perfil sincronizado, com linha de corte
+    rotacionável (4 ângulos), posição por slider ou clique no mapa;
+  - modos de mapa: Hipsometria / Geologia real (CPRM + sills) / Satélite;
+  - FUROS: pontos no mapa e colunas projetadas no perfil (furos a até 1,5 km
+    da linha de corte, coloridos pela unidade atravessada, corpo intrusivo em
+    vermelho) -- dá pra conferir o modelo contra o dado de sondagem;
+  - gráfico de espessura das formações na linha atual, tema escuro/claro.
 
-Fontes: ../2_Banco_de_Dados/{area,curvas,Litologia_PMP}.shp -- via
-_comum_pmp.py. Este script só LÊ essas fontes.
+Mesmos planos por formação do cubo 3D (_comum_pmp.py::calcular_planos_estilizados).
+Fontes: ../2_Banco_de_Dados (area2/curvas3/Litologia_PMP2.shp + banco de poços)
+via _comum_pmp.py; satélite Esri World Imagery (cache). Só LÊ essas fontes.
 
 Uso:
-    python gerar_secao_estilizada_pmp.py
-
+    python gerar_secao_pmp.py
 Gera:
-    secao_estilizada_pmp.html
+    secao_pmp.html
 """
+import base64
+import io
 from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
+import plotly.io as pio
+from PIL import Image
 from plotly.subplots import make_subplots
 
 from _comum_pmp import (
     MARCA_ROXO, MARCA_NAVY, MARCA_CINZA_CLARO, MARCA_FONTE,
     UNIDADES_ESTILIZADO, NOMES_ESTILIZADO, CORES_ESTILIZADO, ESPESSURA_SILL_M,
+    COR_POR_SIGLA, SIGLAS_SILL_INDIVIDUALIZADO, ORDEM_PROFUNDIDADE_FURO,
     logo_base64, carregar_area_pmp, carregar_vertices_curvas_pmp, carregar_litologia_pmp,
     carregar_sills_individualizados, construir_interpolador, avaliar_interpolador, avaliar_plano,
     calcular_planos_estilizados, poligono_para_scatter_xy, pontos_dentro_poligono,
-    botoes_tema, adicionar_escala_e_norte, quantizar,
+    botoes_tema, tema_escuro, adicionar_escala_e_norte, quantizar,
+    obter_satelite_utm, preparar_furos, _intervalos_corpo,
 )
 
 BASE = Path(__file__).resolve().parent
@@ -44,6 +50,10 @@ PASSO_POSICAO_M = 1_500.0  # area nova e bem menor (~26x47km) -- passo mais fino
 N_AMOSTRAS_LINHA = 150
 RESOLUCAO_MAPA = 140
 RAIO_MASCARA_KM = 3.0
+BUFFER_FUROS_M = 1_500.0   # furos até essa distância da linha de corte aparecem no perfil
+PLOTLY_CDN = f"https://cdn.plot.ly/plotly-{__import__('plotly').offline.get_plotlyjs_version()}.min.js"
+NOMES_CLASSES_FURO = [n for _, n, _ in ORDEM_PROFUNDIDADE_FURO] + ["sem topos medidos", "corpo intrusivo"]
+CORES_CLASSES_FURO = [c for _, _, c in ORDEM_PROFUNDIDADE_FURO] + ["#9AA0B4", "#E63946"]
 
 
 def cobertura_bbox(vx, vy, cx, cy, e_min, e_max, n_min, n_max):
@@ -83,6 +93,70 @@ def banda_mascarada(dists, topo, base, mask):
     return np.array(xs), np.array(ys)
 
 
+def satelite_jpeg_uri(largura=1100):
+    """Satélite Esri do retângulo como data-URI JPEG (fundo do mapa em modo Satélite)."""
+    raster, _ = obter_satelite_utm()
+    img = Image.fromarray(np.moveaxis(raster, 0, -1))
+    h = int(round(img.height * largura / img.width))
+    img = img.resize((largura, h), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def preparar_furos_secao(interp_terreno):
+    """Furos (só sondagens) prontos pro mapa/perfil: posição, cota do terreno do
+    modelo na boca (âncora, pra coluna encostar na linha do terreno), segmentos
+    por unidade (ini, fim, classe) e intervalos de corpo intrusivo."""
+    tab = preparar_furos()
+    tab = tab[tab["tipo"] == "Furo"].reset_index(drop=True)
+    x, y = tab["E"].to_numpy(float), tab["N"].to_numpy(float)
+    z0 = avaliar_interpolador(interp_terreno, x, y, raio_mascara_km=60)
+    idx_unid = {col: k for k, (col, _, _) in enumerate(ORDEM_PROFUNDIDADE_FURO)}
+    F = dict(x=[], y=[], z0=[], nome=[], segs=[], corpos=[], hover=[], cor=[])
+    for i, r in tab.iterrows():
+        if np.isnan(z0[i]):
+            continue
+        tops = sorted((float(r[f"Prof_topo_{c}"]), k) for c, k in idx_unid.items() if not np.isnan(r.get(f"Prof_topo_{c}", np.nan)))
+        prof = None if np.isnan(r["Profundidade"]) else float(r["Profundidade"])
+        segs = []
+        for j, (ini, k) in enumerate(tops):
+            fim = tops[j + 1][0] if j + 1 < len(tops) else (prof if prof is not None and prof > ini else None)
+            if fim is not None and fim > ini:
+                segs.append((ini, fim, k))
+        if not tops and prof is not None:
+            segs.append((0.0, prof, len(ORDEM_PROFUNDIDADE_FURO)))   # "sem topos medidos"
+        F["x"].append(float(x[i])); F["y"].append(float(y[i])); F["z0"].append(float(z0[i])); F["nome"].append(r["nome"])
+        F["segs"].append(segs); F["corpos"].append(_intervalos_corpo(r.get("Prof_corpos_intrusivos_SG"))); F["cor"].append(r["cor"])
+        mun = r.get("Municipio")
+        F["hover"].append(f"<b>{r['nome']}</b>" + (f"<br>{mun}" if isinstance(mun, str) else "")
+                          + (f"<br>prof. {prof:.0f} m" if prof is not None else "") + f"<br>{r['unidade_fundo']}")
+    for k in ("x", "y", "z0"):
+        F[k] = np.array(F[k])
+    return F
+
+
+def furos_no_perfil(F, dx, dy, px, py, t, cx, cy, s0):
+    """Colunas de furo (±BUFFER_FUROS_M da linha) projetadas no perfil: 1 conjunto
+    de segmentos por classe (unidade / sem topos / corpo intrusivo) + a base
+    preta (contorno) com todos juntos. Cada segmento: x=[d,d,None], y=[z0-ini, z0-fim, None]."""
+    n_cls = len(NOMES_CLASSES_FURO)
+    cls = [([], [], []) for _ in range(n_cls)]
+    perp = (F["x"] - cx) * px + (F["y"] - cy) * py - t
+    for i in np.where(np.abs(perp) <= BUFFER_FUROS_M)[0]:
+        d = round(float(((F["x"][i] - cx - t * px) * dx + (F["y"][i] - cy - t * py) * dy - s0) / 1000), 3)
+        z0, nome = F["z0"][i], F["nome"][i]
+        for ini, fim, k in F["segs"][i]:
+            cls[k][0].extend([d, d, None]); cls[k][1].extend([round(z0 - ini, 1), round(z0 - fim, 1), None])
+            cls[k][2].extend([f"<b>{nome}</b><br>{NOMES_CLASSES_FURO[k]}: {ini:.0f}–{fim:.0f} m", None, None])
+        for a, b in F["corpos"][i]:
+            k = n_cls - 1
+            cls[k][0].extend([d, d, None]); cls[k][1].extend([round(z0 - a, 1), round(z0 - b, 1), None])
+            cls[k][2].extend([f"<b>{nome}</b><br>corpo intrusivo: {a:.1f}–{b:.1f} m ({b - a:.1f} m)", None, None])
+    base = ([v for c in cls for v in c[0]], [v for c in cls for v in c[1]], [None] * sum(len(c[0]) for c in cls))
+    return dict(base=base, cls=cls)
+
+
 def main():
     poligono, bounds = carregar_area_pmp()
     e_min, n_min, e_max, n_max = bounds
@@ -93,6 +167,9 @@ def main():
     litologia = carregar_litologia_pmp()
     planos = calcular_planos_estilizados(litologia, interp_terreno)
     sills = carregar_sills_individualizados()
+    furos = preparar_furos_secao(interp_terreno)
+    sat_uri = satelite_jpeg_uri()
+    print(f"[info] {len(furos['x'])} furos (buffer {BUFFER_FUROS_M:.0f} m no perfil)")
 
     # --- mapa em planta: hipsometria + geologia real ---
     mx, my = np.meshgrid(np.linspace(e_min, e_max, RESOLUCAO_MAPA), np.linspace(n_min, n_max, RESOLUCAO_MAPA))
@@ -163,13 +240,14 @@ def main():
                 terreno=(dists, quantizar(terreno, 1)),
                 linha_mapa=(quantizar(np.array([xs[0], xs[-1]]), 0), quantizar(np.array([ys[0], ys[-1]]), 0)),
                 bandas=bandas, sill=(sx, sy), espessuras=espessuras,
+                furos=furos_no_perfil(furos, info["dx"], info["dy"], info["px"], info["py"], t, cx, cy, info["s_vals"][0]),
             ))
         todas_secoes.append(secoes_angulo)
 
     # --- figura: mapa (row1,col1) + perfil (row1,col2) + barras (row2) ---
     fig = make_subplots(
         rows=2, cols=2, column_widths=[0.32, 0.68], row_heights=[0.78, 0.22],
-        horizontal_spacing=0.06, vertical_spacing=0.12,
+        horizontal_spacing=0.06, vertical_spacing=0.17,
         specs=[[{}, {}], [{"colspan": 2}, None]],
         subplot_titles=("Mapa (clique p/ mover o corte)", "Perfil", "Espessura na linha atual"),
     )
@@ -178,9 +256,7 @@ def main():
 
     idx_geo_inicio = len(fig.data)
     for row in litologia.itertuples():
-        unidade = row.unidade_padrao
-        eh_sill = row.HIERARQUIA == "Corpo"
-        cor = CORES_ESTILIZADO.get("Gp_SerraGeral" if eh_sill else unidade, "#CCCCCC")
+        cor = COR_POR_SIGLA.get(row.SIGLA_UNID, "#CCCCCC")
         gx, gy = poligono_para_scatter_xy(row.geometry)
         fig.add_trace(go.Scatter(
             x=gx, y=gy, mode="lines", line=dict(width=0), fill="toself", fillcolor=cor,
@@ -193,13 +269,19 @@ def main():
     fig.update_xaxes(showticklabels=False, row=1, col=1, range=[e_min, e_max], autorange=False, scaleanchor="y", scaleratio=1, constrain="domain")
     fig.update_yaxes(showticklabels=False, row=1, col=1, range=[n_min, n_max], autorange=False)
 
+    idx_furos_mapa = len(fig.data)
+    fig.add_trace(go.Scatter(
+        x=furos["x"], y=furos["y"], mode="markers", name="Furos", showlegend=False, text=furos["hover"],
+        hovertemplate="%{text}<extra></extra>", marker=dict(size=6, color=furos["cor"], line=dict(width=1, color=MARCA_NAVY)),
+    ), row=1, col=1)
+
     n_pos_inicial = len(angulos_info[0]["t_vals"])
     p0 = n_pos_inicial // 2
     inicial = todas_secoes[0][p0]
 
     idx_linha_mapa = len(fig.data)
     fig.add_trace(go.Scatter(x=inicial["linha_mapa"][0], y=inicial["linha_mapa"][1], mode="lines",
-                              line=dict(color="black", width=2, dash="dash"), showlegend=False), row=1, col=1)
+                              line=dict(color="#FF3B6B", width=2.5, dash="dash"), showlegend=False), row=1, col=1)
 
     idx_bandas = {}
     for unidade in UNIDADES_ESTILIZADO:
@@ -221,29 +303,49 @@ def main():
 
     idx_terreno_perfil = len(fig.data)
     fig.add_trace(go.Scatter(x=inicial["terreno"][0], y=inicial["terreno"][1], mode="lines",
-                              line=dict(color=MARCA_NAVY, width=2), name="Terreno real", showlegend=True), row=1, col=2)
+                              line=dict(color="#E8A33D", width=2), name="Terreno real", showlegend=True), row=1, col=2)
 
-    idx_traces_frame = [idx_linha_mapa] + [idx_bandas[u] for u in UNIDADES_ESTILIZADO] + [idx_sill, idx_terreno_perfil]
+    # furos no perfil: contorno preto (1 legenda) + 1 traço colorido por classe (unidade / sem topos / corpo intrusivo)
+    fb = inicial["furos"]["base"]
+    idx_furos_base = len(fig.data)
+    fig.add_trace(go.Scatter(x=fb[0], y=fb[1], mode="lines", line=dict(color="black", width=9), name=f"Furos (±{BUFFER_FUROS_M / 1000:.1f} km)",
+                              legendgroup="furos", showlegend=True, hoverinfo="skip"), row=1, col=2)
+    idx_furos_cls = []
+    for k, (nome_k, cor_k) in enumerate(zip(NOMES_CLASSES_FURO, CORES_CLASSES_FURO)):
+        cx_, cy_, ct_ = inicial["furos"]["cls"][k]
+        idx_furos_cls.append(len(fig.data))
+        fig.add_trace(go.Scatter(x=cx_, y=cy_, text=ct_, mode="lines", line=dict(color=cor_k, width=5 if k < len(NOMES_CLASSES_FURO) - 1 else 7),
+                                  name=f"Furo · {nome_k}", legendgroup="furos", showlegend=False,
+                                  hovertemplate="%{text}<extra></extra>"), row=1, col=2)
+
+    idx_traces_frame = ([idx_linha_mapa] + [idx_bandas[u] for u in UNIDADES_ESTILIZADO]
+                        + [idx_sill, idx_terreno_perfil, idx_furos_base] + idx_furos_cls)
 
     comprimento0_km = (angulos_info[0]["s_vals"][-1] - angulos_info[0]["s_vals"][0]) / 1000
     fig.update_xaxes(title_text="Distância ao longo da seção (km)", row=1, col=2, range=[0, comprimento0_km], autorange=False)
     fig.update_yaxes(title_text="Altitude (m)", row=1, col=2)
 
-    ordem_frame = ["linha_mapa"] + UNIDADES_ESTILIZADO + ["sill", "terreno"]
+    ordem_frame = (["linha_mapa"] + UNIDADES_ESTILIZADO + ["sill", "terreno", "furos_base"]
+                   + [f"furos_{k}" for k in range(len(NOMES_CLASSES_FURO))])
     frames = []
     for a, secoes_angulo in enumerate(todas_secoes):
         for p, secao in enumerate(secoes_angulo):
             dados_frame = []
             for chave in ordem_frame:
+                text = None
                 if chave == "linha_mapa":
                     x, y = secao["linha_mapa"]
                 elif chave == "terreno":
                     x, y = secao["terreno"]
                 elif chave == "sill":
                     x, y = secao["sill"]
+                elif chave == "furos_base":
+                    x, y, _ = secao["furos"]["base"]
+                elif chave.startswith("furos_"):
+                    x, y, text = secao["furos"]["cls"][int(chave.split("_")[1])]
                 else:
                     x, y = secao["bandas"][chave]
-                dados_frame.append(go.Scatter(x=x, y=y))
+                dados_frame.append(go.Scatter(x=x, y=y, text=text) if text is not None else go.Scatter(x=x, y=y))
             frames.append(go.Frame(data=dados_frame, name=f"{a}_{p}", traces=idx_traces_frame))
     fig.frames = frames
 
@@ -256,38 +358,51 @@ def main():
     ), row=2, col=1)
     fig.update_yaxes(title_text="Espessura (m)", row=2, col=1)
 
+    # --- menus: ângulo (skip -- tratado em JS), modo do mapa (update: visibilidade + fundo satélite), furos, tema
+    idx_mapa_cor = [0] + list(range(idx_geo_inicio, idx_geo_fim + 1))
     botoes_angulo = [dict(label=nome, method="skip") for nome, _ in ANGULOS]
     botoes_mapa_cor = [
-        dict(label="Mapa: Hipsometria", method="restyle", args=[{"visible": [True] + [False] * n_geo}, [0] + list(range(idx_geo_inicio, idx_geo_fim + 1))]),
-        dict(label="Mapa: Geologia (real + sills)", method="restyle", args=[{"visible": [False] + [True] * n_geo}, [0] + list(range(idx_geo_inicio, idx_geo_fim + 1))]),
+        dict(label="Mapa: Hipsometria", method="update",
+             args=[{"visible": [True] + [False] * n_geo, "opacity": [1] + [1] * n_geo}, {"images[0].visible": False}, idx_mapa_cor]),
+        dict(label="Mapa: Geologia (CPRM + sills)", method="update",
+             args=[{"visible": [True] + [True] * n_geo, "opacity": [0] + [1] * n_geo}, {"images[0].visible": False}, idx_mapa_cor]),
+        dict(label="Mapa: Satélite", method="update",
+             args=[{"visible": [True] + [False] * n_geo, "opacity": [0] + [1] * n_geo}, {"images[0].visible": True}, idx_mapa_cor]),
+    ]   # o heatmap fica sempre visível (opacidade 0 nos outros modos) -- é ele que recebe o clique que move a linha de corte
+    idx_furos_todos = [idx_furos_mapa, idx_furos_base] + idx_furos_cls
+    botoes_furos = [
+        dict(label="Furos: ON", method="restyle", args=[{"visible": True}, idx_furos_todos]),
+        dict(label="Furos: OFF", method="restyle", args=[{"visible": False}, idx_furos_todos]),
     ]
 
+    tema = tema_escuro()
+    estilo_menu = dict(direction="down", xanchor="left", y=1.34, yanchor="top", bgcolor="#4A4A4A", font=dict(color="white"))
     fig.update_layout(
-        title=dict(text="PMP — Seção estilizada (mapa interativo, sem poço)", font=dict(family=MARCA_FONTE, color=MARCA_NAVY, size=18)),
-        paper_bgcolor=MARCA_CINZA_CLARO, font=dict(family=MARCA_FONTE),
-        legend=dict(x=1.01, y=0.9),
-        margin=dict(l=60, r=140, t=150, b=60),
+        paper_bgcolor=tema["paper_bgcolor"], plot_bgcolor=tema["plot_bgcolor"],
+        font=dict(family=MARCA_FONTE, color=tema["font_color"]),
+        legend=dict(x=1.01, y=0.9, bgcolor="rgba(0,0,0,0)"),
+        margin=dict(l=60, r=170, t=175, b=60),
         updatemenus=[
-            dict(buttons=botoes_angulo, direction="down", x=0.0, xanchor="left", y=1.2, yanchor="top", bgcolor="#4A4A4A", font=dict(color="white")),
-            dict(buttons=botoes_mapa_cor, direction="down", x=0.20, xanchor="left", y=1.2, yanchor="top", bgcolor="#4A4A4A", font=dict(color="white")),
-            dict(buttons=botoes_tema(eixos_2d=["xaxis", "yaxis", "xaxis2", "yaxis2", "xaxis3", "yaxis3"]),
-                 direction="down", x=0.46, xanchor="left", y=1.2, yanchor="top", bgcolor="#4A4A4A", font=dict(color="white")),
+            dict(buttons=botoes_angulo, x=0.0, **estilo_menu),
+            dict(buttons=botoes_mapa_cor, x=0.16, **estilo_menu),
+            dict(buttons=botoes_furos, x=0.40, **estilo_menu),
+            dict(buttons=botoes_tema(eixos_2d=["xaxis", "yaxis", "xaxis2", "yaxis2", "xaxis3", "yaxis3"]), x=0.50, active=1, **estilo_menu),
         ],
         sliders=[dict(
-            active=p0, x=0.0, len=0.66, xanchor="left", y=1.10, yanchor="top",
-            currentvalue=dict(prefix="Posição do corte: ", font=dict(color=MARCA_NAVY)),
+            active=p0, x=0.0, len=0.66, xanchor="left", y=1.19, yanchor="top",
+            currentvalue=dict(prefix="Posição do corte: ", font=dict(size=12, color=tema["font_color"])),
+            font=dict(size=1, color="rgba(0,0,0,0)"),   # esconde os rótulos das 23 posições (só o valor atual aparece)
             steps=[
                 dict(method="animate", args=[[f"0_{p}"], dict(mode="immediate", frame=dict(duration=0, redraw=True), transition=dict(duration=0))],
                      label=f"{angulos_info[0]['t_vals'][p]:+.0f} m")
                 for p in range(n_pos_inicial)
             ],
         )],
+        images=[dict(source=sat_uri, xref="x", yref="y", x=e_min, y=n_max, sizex=e_max - e_min, sizey=n_max - n_min,
+                     xanchor="left", yanchor="top", sizing="stretch", layer="below", opacity=1, visible=False)],
     )
-
-    logo = logo_base64()
-    if logo:
-        fig.add_layout_image(dict(source=f"data:image/jpeg;base64,{logo}", xref="paper", yref="paper", x=1.0, y=1.24,
-                                   sizex=0.09, sizey=0.09, xanchor="right", yanchor="top"))
+    for eixo in ("xaxis", "yaxis", "xaxis2", "yaxis2", "xaxis3", "yaxis3"):
+        fig.layout[eixo].update(color=tema["axis_color"], gridcolor=tema["grid_color"])
 
     angulos_js = ",\n        ".join(
         "{dx:%.6f, dy:%.6f, px:%.6f, py:%.6f, s0:%.3f, compKm:%.3f, t:[%s]}" % (
@@ -334,12 +449,12 @@ def main():
             anguloAtual = a;
             var posMeio = Math.floor(ANGULOS[a].t.length / 2);
             Plotly.relayout(gd, {{'sliders[0].steps': stepsParaAngulo(a), 'sliders[0].active': posMeio, 'xaxis2.range': [0, ANGULOS[a].compKm]}});
-            Plotly.animate(gd, [a + '_' + posMeio], {{mode: 'immediate', frame: {{duration: 0, redraw: true}}, transition: {{duration: 0}}}});
+            Plotly.animate(gd, [a + '_' + posMeio], {{mode: 'immediate', frame: {{duration: 0, redraw: true}}, transition: {{duration: 0}}}}).catch(function() {{}});
             atualizarBarra(a, posMeio);
         }}
         gd.on('plotly_buttonclicked', function(ev) {{
             if (typeof ev.active !== 'number') return;
-            if (Math.abs(ev.menu.y - 1.2) <= 0.01 && ev.menu.x < 0.1) {{ irParaAngulo(ev.active); }}
+            if (Math.abs(ev.menu.y - 1.34) <= 0.01 && ev.menu.x < 0.1) {{ irParaAngulo(ev.active); }}
         }});
         gd.on('plotly_sliderchange', function() {{
             setTimeout(function() {{ atualizarBarra(anguloAtual, gd.layout.sliders[0].active); }}, 0);
@@ -355,15 +470,74 @@ def main():
                 if (d < melhorDist) {{ melhorDist = d; melhorIdx = p; }}
             }}
             Plotly.relayout(gd, {{'sliders[0].active': melhorIdx}});
-            Plotly.animate(gd, [anguloAtual + '_' + melhorIdx], {{mode: 'immediate', frame: {{duration: 0, redraw: true}}, transition: {{duration: 0}}}});
+            Plotly.animate(gd, [anguloAtual + '_' + melhorIdx], {{mode: 'immediate', frame: {{duration: 0, redraw: true}}, transition: {{duration: 0}}}}).catch(function() {{}});
             atualizarBarra(anguloAtual, melhorIdx);
         }});
+        // abre com o slider na posição central (o Plotly ignora sliders.active no carregamento com frames)
+        Plotly.relayout(gd, {{'sliders[0].active': {p0}}});
+        atualizarBarra(0, {p0});
     }})();
     """
 
-    fig.write_html(str(OUT_HTML), include_plotlyjs="cdn", post_script=post_script)
-    print(f"[info] {len(angulos_info)} ângulos, {n_pos_inicial} posições iniciais, {len(sills)} sills")
+    logo = logo_base64()
+    grafico = pio.to_html(fig, full_html=False, include_plotlyjs=False, post_script=post_script, div_id="secao",
+                          config={"responsive": True, "displaylogo": False})
+    html = TEMPLATE
+    for token, valor in {
+        "@@PLOTLY@@": PLOTLY_CDN, "@@FONTE@@": MARCA_FONTE, "@@NAVY@@": MARCA_NAVY, "@@ROXO@@": MARCA_ROXO,
+        "@@CINZA@@": MARCA_CINZA_CLARO,
+        "@@LOGO@@": f'<img src="data:image/jpeg;base64,{logo}" alt="GS Tech">' if logo else "",
+        "@@GRAFICO@@": grafico,
+    }.items():
+        html = html.replace(token, valor)
+    OUT_HTML.write_text(html, encoding="utf-8")
+    print(f"[info] {len(angulos_info)} ângulos, {n_pos_inicial} posições iniciais, {len(sills)} sills, {len(frames)} frames")
     print(f"-> {OUT_HTML} ({OUT_HTML.stat().st_size / 1024:.0f} KB)")
+
+
+TEMPLATE = r"""<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="assets/favicon.png">
+<link rel="shortcut icon" href="assets/favicon.ico">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<title>Seção 2D interativa — PMP</title>
+<script src="@@PLOTLY@@"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: @@NAVY@@; color: @@CINZA@@; font-family: @@FONTE@@; display: flex; flex-direction: column; transition: background .2s; }
+  body.tema-claro { background: #FFFFFF; color: @@NAVY@@; }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 10px 24px; border-bottom: 1px solid @@ROXO@@; gap: 16px; flex-shrink: 0; }
+  header h1 { font-size: 19px; margin: 0; }
+  header h1 b { color: @@ROXO@@; }
+  header img { width: 46px; height: 46px; border-radius: 50%; border: 2px solid @@ROXO@@; box-shadow: 0 0 10px rgba(123,47,255,.6); }
+  #wrap { flex: 1; min-height: 0; }
+  #wrap .plotly-graph-div, #wrap > div { height: 100% !important; }
+  footer { text-align: center; padding: 4px; opacity: .5; font-size: 11px; flex-shrink: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1><b>Seção 2D interativa</b> — PMP · Criciúma</h1>
+  @@LOGO@@
+</header>
+<div id="wrap">@@GRAFICO@@</div>
+<footer>GS Tech · PMP</footer>
+<script>
+  (function() {
+    var gd = document.getElementById('secao');
+    // o dropdown de tema do Plotly só recolore o gráfico; aqui a página inteira acompanha
+    gd.on('plotly_relayout', function(ev) {
+      if (ev && ev['paper_bgcolor'] !== undefined) document.body.classList.toggle('tema-claro', ev['paper_bgcolor'] === '#FFFFFF');
+    });
+  })();
+</script>
+</body>
+</html>
+"""
 
 
 if __name__ == "__main__":
