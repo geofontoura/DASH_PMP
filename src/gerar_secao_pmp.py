@@ -145,6 +145,7 @@ def furos_no_perfil(F, dx, dy, px, py, t, cx, cy, s0):
     preta (contorno) com todos juntos. Cada segmento: x=[d,d,None], y=[z0-ini, z0-fim, None]."""
     n_cls = len(NOMES_CLASSES_FURO)
     cls = [([], [], []) for _ in range(n_cls)]
+    lab = ([], [], [])   # rótulo (código do furo) na base de cada coluna
     perp = (F["x"] - cx) * px + (F["y"] - cy) * py - t
     for i in np.where(np.abs(perp) <= BUFFER_FUROS_M)[0]:
         d = round(float(((F["x"][i] - cx - t * px) * dx + (F["y"][i] - cy - t * py) * dy - s0) / 1000), 3)
@@ -156,8 +157,11 @@ def furos_no_perfil(F, dx, dy, px, py, t, cx, cy, s0):
             k = n_cls - 1
             cls[k][0].extend([d, d, None]); cls[k][1].extend([round(z0 - a, 1), round(z0 - b, 1), None])
             cls[k][2].extend([f"<b>{nome}</b><br>corpo intrusivo: {a:.1f}–{b:.1f} m ({b - a:.1f} m)", None, None])
+        fundo = max([f for _, f, _ in F["segs"][i]] + [b for _, b in F["corpos"][i]], default=None)
+        if fundo is not None:
+            lab[0].append(d); lab[1].append(round(z0 - fundo, 1)); lab[2].append(nome)
     base = ([v for c in cls for v in c[0]], [v for c in cls for v in c[1]], [None] * sum(len(c[0]) for c in cls))
-    return dict(base=base, cls=cls)
+    return dict(base=base, cls=cls, lab=lab)
 
 
 def furos_na_polilinha(F, linha):
@@ -166,6 +170,7 @@ def furos_na_polilinha(F, linha):
     critério de inclusão é a distância perpendicular à polilinha."""
     n_cls = len(NOMES_CLASSES_FURO)
     cls = [([], [], []) for _ in range(n_cls)]
+    lab = ([], [], [])   # rótulo (código do furo) na base de cada coluna
     for i in range(len(F["x"])):
         pt = shapely.Point(F["x"][i], F["y"][i])
         if linha.distance(pt) > BUFFER_FUROS_M:
@@ -179,8 +184,11 @@ def furos_na_polilinha(F, linha):
             k = n_cls - 1
             cls[k][0].extend([d, d, None]); cls[k][1].extend([round(z0 - a, 1), round(z0 - b, 1), None])
             cls[k][2].extend([f"<b>{nome}</b><br>corpo intrusivo: {a:.1f}–{b:.1f} m ({b - a:.1f} m)", None, None])
+        fundo = max([f for _, f, _ in F["segs"][i]] + [b for _, b in F["corpos"][i]], default=None)
+        if fundo is not None:
+            lab[0].append(d); lab[1].append(round(z0 - fundo, 1)); lab[2].append(nome)
     base = ([v for c in cls for v in c[0]], [v for c in cls for v in c[1]], [None] * sum(len(c[0]) for c in cls))
-    return dict(base=base, cls=cls)
+    return dict(base=base, cls=cls, lab=lab)
 
 
 def secao_na_polilinha(linha, interp_terreno, planos, sills, furos):
@@ -352,7 +360,7 @@ def main():
         lt[-1] = d["nome"] + "'"
         lx.append(None); ly.append(None); lt.append("")
     fig.add_trace(go.Scatter(x=lx, y=ly, text=lt, mode="lines+text", line=dict(color="rgba(255,255,255,.75)", width=1.6, dash="dot"),
-                              textposition="top center", textfont=dict(size=12, color="#FFFFFF"), showlegend=False, hoverinfo="skip"), row=1, col=1)
+                              textposition="top center", textfont=dict(size=13, color=MARCA_NAVY), showlegend=False, hoverinfo="skip"), row=1, col=1)
 
     n_pos_inicial = len(angulos_info[0]["t_vals"])
     p0 = n_pos_inicial // 2
@@ -396,15 +404,21 @@ def main():
         fig.add_trace(go.Scatter(x=cx_, y=cy_, text=ct_, mode="lines", line=dict(color=cor_k, width=5 if k < len(NOMES_CLASSES_FURO) - 1 else 7),
                                   name=f"Furo · {nome_k}", showlegend=False, hovertemplate="%{text}<extra></extra>"), row=1, col=2)
 
+    # código do furo na base de cada coluna, com buffer branco (halo via CSS: .textpoint text { stroke: white })
+    lb = inicial["furos"]["lab"]
+    idx_furos_rot = len(fig.data)
+    fig.add_trace(go.Scatter(x=lb[0], y=lb[1], text=lb[2], mode="text", textposition="bottom center",
+                              textfont=dict(size=9, color=MARCA_NAVY, family=MARCA_FONTE), name="Códigos dos furos",
+                              showlegend=False, hoverinfo="skip", cliponaxis=True), row=1, col=2)
     idx_traces_frame = ([idx_linha_mapa] + [idx_bandas[u] for u in UNIDADES_ESTILIZADO]
-                        + [idx_sill, idx_terreno_perfil, idx_furos_base] + idx_furos_cls)
+                        + [idx_sill, idx_terreno_perfil, idx_furos_base] + idx_furos_cls + [idx_furos_rot])
 
     comprimento0_km = (angulos_info[0]["s_vals"][-1] - angulos_info[0]["s_vals"][0]) / 1000
     fig.update_xaxes(title_text="Distância ao longo da seção (km)", row=1, col=2, range=[0, comprimento0_km], autorange=False)
     fig.update_yaxes(title_text="Altitude (m)", row=1, col=2)
 
     ordem_frame = (["linha_mapa"] + UNIDADES_ESTILIZADO + ["sill", "terreno", "furos_base"]
-                   + [f"furos_{k}" for k in range(len(NOMES_CLASSES_FURO))])
+                   + [f"furos_{k}" for k in range(len(NOMES_CLASSES_FURO))] + ["rotulos"])
     def montar_dados_frame(secao):
         dados = []
         for chave in ordem_frame:
@@ -417,6 +431,9 @@ def main():
                 x, y = secao["sill"]
             elif chave == "furos_base":
                 x, y, _ = secao["furos"]["base"]
+            elif chave == "rotulos":
+                x, y, text = secao["furos"]["lab"]
+                dados.append(go.Scatter(x=x, y=y, text=text)); continue
             elif chave.startswith("furos_"):
                 x, y, text = secao["furos"]["cls"][int(chave.split("_")[1])]
             else:
@@ -459,7 +476,7 @@ def main():
     furos_legenda = [dict(nome=n, cor=c) for n, c in zip(NOMES_CLASSES_FURO, CORES_CLASSES_FURO)]
     cfg = dict(
         cx=cx, cy=cy, p0=p0, idxMapaMax=idx_geo_fim, idxMapaCor=idx_mapa_cor, modos=modos_mapa,
-        idxFuros=[idx_furos_mapa, idx_furos_base] + idx_furos_cls,
+        idxFuros=[idx_furos_mapa, idx_furos_base] + idx_furos_cls + [idx_furos_rot],
         angulos=[dict(nome=info["nome"], px=info["px"], py=info["py"], compKm=(info["s_vals"][-1] - info["s_vals"][0]) / 1000,
                       t=[round(float(t), 2) for t in info["t_vals"]]) for info in angulos_info],
         temas=dict(escuro=dict(paper=tema_escuro()["paper_bgcolor"], plot=tema_escuro()["plot_bgcolor"], font=tema_escuro()["font_color"],
@@ -637,6 +654,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   .leg-item.off { opacity: .35; text-decoration: line-through; }
   #legenda i { width: 14px; height: 10px; border-radius: 2px; display: inline-block; border: 1px solid rgba(255,255,255,.35); }
   .leg-sep { opacity: .5; font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; margin-left: 10px; }
+  #secao .textpoint text { paint-order: stroke fill; stroke: #FFFFFF; stroke-width: 3.2px; stroke-linejoin: round; font-weight: 600; }
   #wrap { flex: 1; min-height: 0; padding: 14px 8px 0 8px; }
   #wrap .plotly-graph-div, #wrap > div { height: 100% !important; }
   footer { text-align: center; padding: 3px; opacity: .5; font-size: 10.5px; flex-shrink: 0; }
