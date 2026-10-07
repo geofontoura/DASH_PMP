@@ -35,7 +35,7 @@ from _comum_pmp import (
     UNIDADES_ESTILIZADO, NOMES_ESTILIZADO, CORES_ESTILIZADO, ESPESSURA_SILL_M,
     COR_POR_SIGLA, SIGLAS_SILL_INDIVIDUALIZADO, ORDEM_PROFUNDIDADE_FURO,
     logo_base64, carregar_area_pmp, carregar_vertices_curvas_pmp, carregar_litologia_pmp,
-    carregar_sills_individualizados, construir_interpolador, avaliar_interpolador, avaliar_plano,
+    carregar_sills_individualizados, construir_interpolador, avaliar_interpolador, avaliar_plano, plano_z,
     calcular_planos_estilizados, poligono_para_scatter_xy, pontos_dentro_poligono,
     tema_claro, tema_escuro, adicionar_escala_e_norte, quantizar,
     obter_satelite_utm, preparar_furos, _intervalos_corpo, carregar_linhas_secao,
@@ -139,7 +139,16 @@ def preparar_furos_secao(interp_terreno):
     return F
 
 
-def furos_no_perfil(F, dx, dy, px, py, t, cx, cy, s0):
+def _topo_terreno(terr, d):
+    """Elevação do terreno da LINHA DE CORTE na distância d (km) -- topo máximo das colunas de furo."""
+    if terr is None:
+        return np.inf
+    dd, zz = np.asarray(terr[0], float), np.asarray(terr[1], float)
+    m = np.isfinite(zz)
+    return float(np.interp(d, dd[m], zz[m])) if m.any() else np.inf
+
+
+def furos_no_perfil(F, dx, dy, px, py, t, cx, cy, s0, terr=None):
     """Colunas de furo (±BUFFER_FUROS_M da linha) projetadas no perfil: 1 conjunto
     de segmentos por classe (unidade / sem topos / corpo intrusivo) + a base
     preta (contorno) com todos juntos. Cada segmento: x=[d,d,None], y=[z0-ini, z0-fim, None]."""
@@ -150,21 +159,22 @@ def furos_no_perfil(F, dx, dy, px, py, t, cx, cy, s0):
     for i in np.where(np.abs(perp) <= BUFFER_FUROS_M)[0]:
         d = round(float(((F["x"][i] - cx - t * px) * dx + (F["y"][i] - cy - t * py) * dy - s0) / 1000), 3)
         z0, nome = F["z0"][i], F["nome"][i]
+        zt = _topo_terreno(terr, d)   # a coluna nunca passa da topografia da linha (o furo pode estar a até 1,5 km dela)
         for ini, fim, k in F["segs"][i]:
-            cls[k][0].extend([d, d, None]); cls[k][1].extend([round(z0 - ini, 1), round(z0 - fim, 1), None])
+            cls[k][0].extend([d, d, None]); cls[k][1].extend([round(min(z0 - ini, zt), 1), round(min(z0 - fim, zt), 1), None])
             cls[k][2].extend([f"<b>{nome}</b><br>{NOMES_CLASSES_FURO[k]}: {ini:.0f}–{fim:.0f} m", None, None])
         for a, b in F["corpos"][i]:
             k = n_cls - 1
-            cls[k][0].extend([d, d, None]); cls[k][1].extend([round(z0 - a, 1), round(z0 - b, 1), None])
+            cls[k][0].extend([d, d, None]); cls[k][1].extend([round(min(z0 - a, zt), 1), round(min(z0 - b, zt), 1), None])
             cls[k][2].extend([f"<b>{nome}</b><br>corpo intrusivo: {a:.1f}–{b:.1f} m ({b - a:.1f} m)", None, None])
         fundo = max([f for _, f, _ in F["segs"][i]] + [b for _, b in F["corpos"][i]], default=None)
         if fundo is not None:
-            lab[0].append(d); lab[1].append(round(z0 - fundo, 1)); lab[2].append(nome)
+            lab[0].append(d); lab[1].append(round(min(z0 - fundo, zt), 1)); lab[2].append(nome)
     base = ([v for c in cls for v in c[0]], [v for c in cls for v in c[1]], [None] * sum(len(c[0]) for c in cls))
     return dict(base=base, cls=cls, lab=lab)
 
 
-def furos_na_polilinha(F, linha):
+def furos_na_polilinha(F, linha, terr=None):
     """Como furos_no_perfil, mas pra uma polilinha (seção A-D): a distância no
     perfil é o comprimento ao longo da linha até a projeção do furo, e o
     critério de inclusão é a distância perpendicular à polilinha."""
@@ -177,16 +187,17 @@ def furos_na_polilinha(F, linha):
             continue
         d = round(float(linha.project(pt)) / 1000, 3)
         z0, nome = F["z0"][i], F["nome"][i]
+        zt = _topo_terreno(terr, d)   # a coluna nunca passa da topografia da linha (o furo pode estar a até 1,5 km dela)
         for ini, fim, k in F["segs"][i]:
-            cls[k][0].extend([d, d, None]); cls[k][1].extend([round(z0 - ini, 1), round(z0 - fim, 1), None])
+            cls[k][0].extend([d, d, None]); cls[k][1].extend([round(min(z0 - ini, zt), 1), round(min(z0 - fim, zt), 1), None])
             cls[k][2].extend([f"<b>{nome}</b><br>{NOMES_CLASSES_FURO[k]}: {ini:.0f}–{fim:.0f} m", None, None])
         for a, b in F["corpos"][i]:
             k = n_cls - 1
-            cls[k][0].extend([d, d, None]); cls[k][1].extend([round(z0 - a, 1), round(z0 - b, 1), None])
+            cls[k][0].extend([d, d, None]); cls[k][1].extend([round(min(z0 - a, zt), 1), round(min(z0 - b, zt), 1), None])
             cls[k][2].extend([f"<b>{nome}</b><br>corpo intrusivo: {a:.1f}–{b:.1f} m ({b - a:.1f} m)", None, None])
         fundo = max([f for _, f, _ in F["segs"][i]] + [b for _, b in F["corpos"][i]], default=None)
         if fundo is not None:
-            lab[0].append(d); lab[1].append(round(z0 - fundo, 1)); lab[2].append(nome)
+            lab[0].append(d); lab[1].append(round(min(z0 - fundo, zt), 1)); lab[2].append(nome)
     base = ([v for c in cls for v in c[0]], [v for c in cls for v in c[1]], [None] * sum(len(c[0]) for c in cls))
     return dict(base=base, cls=cls, lab=lab)
 
@@ -203,12 +214,12 @@ def secao_na_polilinha(linha, interp_terreno, planos, sills, furos):
     terreno = avaliar_interpolador(interp_terreno, xs, ys, raio_mascara_km=RAIO_MASCARA_KM)
     contatos, corte = {}, terreno.copy()
     for unidade in UNIDADES_ESTILIZADO:
-        corte = np.minimum(corte, avaliar_plano(planos[unidade], xs, ys))
+        corte = np.minimum(corte, plano_z(planos, unidade, xs, ys))
         contatos[unidade] = corte.copy()
     bandas = {}
     for i, unidade in enumerate(UNIDADES_ESTILIZADO):
         topo = contatos[unidade]
-        base = contatos[UNIDADES_ESTILIZADO[i + 1]] if i + 1 < len(UNIDADES_ESTILIZADO) else avaliar_plano(planos[unidade], xs, ys) - 300.0
+        base = contatos[UNIDADES_ESTILIZADO[i + 1]] if i + 1 < len(UNIDADES_ESTILIZADO) else avaliar_plano(planos[unidade], xs, ys) - 450.0
         bandas[unidade] = (np.concatenate([dists, dists[::-1]]), np.concatenate([quantizar(topo, 1), quantizar(base, 1)[::-1]]))
     dentro = np.zeros_like(xs, dtype=bool)
     for _, geom_sill in sills:
@@ -217,7 +228,7 @@ def secao_na_polilinha(linha, interp_terreno, planos, sills, furos):
     vx, vy = np.array(linha.coords)[:, 0], np.array(linha.coords)[:, 1]
     return dict(
         terreno=(dists, quantizar(terreno, 1)), linha_mapa=(quantizar(vx, 0), quantizar(vy, 0)),
-        bandas=bandas, sill=(sx, sy), furos=furos_na_polilinha(furos, linha),
+        bandas=bandas, sill=(sx, sy), furos=furos_na_polilinha(furos, linha, terr=(dists, terreno)),
     ), comp / 1000
 
 
@@ -271,14 +282,14 @@ def main():
             contatos = {}
             corte_atual = terreno.copy()
             for unidade in UNIDADES_ESTILIZADO:
-                plano = avaliar_plano(planos[unidade], xs, ys)
+                plano = plano_z(planos, unidade, xs, ys)
                 corte_atual = np.minimum(corte_atual, plano)
                 contatos[unidade] = corte_atual.copy()
 
             bandas = {}
             for i, unidade in enumerate(UNIDADES_ESTILIZADO):
                 topo = contatos[unidade]
-                base = contatos[UNIDADES_ESTILIZADO[i + 1]] if i + 1 < len(UNIDADES_ESTILIZADO) else avaliar_plano(planos[unidade], xs, ys) - 300.0
+                base = contatos[UNIDADES_ESTILIZADO[i + 1]] if i + 1 < len(UNIDADES_ESTILIZADO) else avaliar_plano(planos[unidade], xs, ys) - 450.0
                 bandas[unidade] = (
                     np.concatenate([dists, dists[::-1]]),
                     np.concatenate([quantizar(topo, 1), quantizar(base, 1)[::-1]]),
@@ -302,7 +313,7 @@ def main():
                 terreno=(dists, quantizar(terreno, 1)),
                 linha_mapa=(quantizar(np.array([xs[0], xs[-1]]), 0), quantizar(np.array([ys[0], ys[-1]]), 0)),
                 bandas=bandas, sill=(sx, sy),
-                furos=furos_no_perfil(furos, info["dx"], info["dy"], info["px"], info["py"], t, cx, cy, info["s_vals"][0]),
+                furos=furos_no_perfil(furos, info["dx"], info["dy"], info["px"], info["py"], t, cx, cy, info["s_vals"][0], terr=(dists, terreno)),
             ))
         todas_secoes.append(secoes_angulo)
 
@@ -463,11 +474,17 @@ def main():
 
     idx_mapa_cor = [0] + list(range(idx_geo_inicio, idx_geo_fim + 1))
     # o heatmap fica sempre visível (opacidade 0 nos outros modos) -- é ele que recebe o clique que move a linha de corte
+    MODO_INICIAL = 1   # abre com a Geologia (CPRM + sills)
     modos_mapa = [
         dict(nome="Hipsometria", visible=[True] + [False] * n_geo, opacity=[1] + [1] * n_geo, img=False),
         dict(nome="Geologia (CPRM + sills)", visible=[True] + [True] * n_geo, opacity=[0] + [1] * n_geo, img=False),
         dict(nome="Satélite", visible=[True] + [False] * n_geo, opacity=[0] + [1] * n_geo, img=True),
     ]
+    m0 = modos_mapa[MODO_INICIAL]
+    fig.data[0].opacity = m0["opacity"][0]
+    for j, v in enumerate(m0["visible"][1:]):
+        fig.data[idx_geo_inicio + j].visible = v
+    fig.layout.images[0].visible = m0["img"]
     legenda = (
         [dict(nome=NOMES_ESTILIZADO[u], cor=CORES_ESTILIZADO[u], idx=[idx_bandas[u]]) for u in UNIDADES_ESTILIZADO]
         + [dict(nome="Sill (Gp. Serra Geral)", cor=CORES_ESTILIZADO["Gp_SerraGeral"], idx=[idx_sill]),
@@ -487,8 +504,8 @@ def main():
         secoes=[dict(nome=d['nome'], compKm=d['compKm']) for d in secoes_fixas],
     )
 
-    def opcoes(itens):
-        return "".join(f'<option value="{i}">{n}</option>' for i, n in enumerate(itens))
+    def opcoes(itens, sel=0):
+        return "".join(f'<option value="{i}"{" selected" if i == sel else ""}>{n}</option>' for i, n in enumerate(itens))
 
     html_botoes_secao = "".join(f'<button class="btn btn-secao" data-i="{i}" title="Seção {d["nome"]} — {d["compKm"]:.1f} km">{d["nome"]}</button>'
                                 for i, d in enumerate(secoes_fixas))
@@ -505,7 +522,7 @@ def main():
         "@@CINZA@@": MARCA_CINZA_CLARO,
         "@@LOGO@@": f'<img src="data:image/jpeg;base64,{logo}" alt="GS Tech">' if logo else "",
         "@@OPC_ANGULO@@": opcoes([a["nome"] for a in cfg["angulos"]]),
-        "@@OPC_MAPA@@": opcoes([m["nome"] for m in modos_mapa]),
+        "@@OPC_MAPA@@": opcoes([m["nome"] for m in modos_mapa], MODO_INICIAL),
         "@@NPOS@@": str(len(angulos_info[0]["t_vals"]) - 1), "@@P0@@": str(p0),
         "@@BOTOES_SECAO@@": html_botoes_secao, "@@LEGENDA@@": html_legenda, "@@FUROS_LEG@@": html_furos_leg,
         "@@GRAFICO@@": grafico,
@@ -538,16 +555,17 @@ POST_JS = r"""
         marcarSecao(null);
         Plotly.relayout(gd, {'xaxis2.range': [0, C.angulos[anguloAtual].compKm]});
     }
+    function reescalarY() { return Plotly.relayout(gd, {'yaxis2.autorange': true}); }   // o animate não reajusta o eixo Y sozinho
     function irPara(a, p) {
         anguloAtual = a; posAtual = p; sl.value = p; lab.textContent = rotulo(a, p);
-        Plotly.animate(gd, [a + '_' + p], OPT).catch(function() {});
+        Plotly.animate(gd, [a + '_' + p], OPT).then(reescalarY).catch(function() {});
     }
     function irSecao(i) {
         marcarSecao(i);
         var s = C.secoes[i];
         lab.textContent = 'Seção ' + s.nome + ' · ' + s.compKm.toFixed(1) + ' km';
         Plotly.relayout(gd, {'xaxis2.range': [0, s.compKm]});
-        Plotly.animate(gd, ['L_' + i], OPT).catch(function() {});
+        Plotly.animate(gd, ['L_' + i], OPT).then(reescalarY).catch(function() {});
     }
     botoesSecao.forEach(function(b) {
         b.addEventListener('click', function() {

@@ -397,7 +397,60 @@ def calcular_planos_estilizados(litologia_gdf, interp_terreno, furos=None):
         if u not in planos:
             print(f"[aviso] {u}: sem dado nenhum, sem plano ajustado")
             planos[u] = None
+    planos["_residuo"] = campo_residuo_furos(planos, furos)
     return planos
+
+
+def campo_residuo_furos(planos, furos, raio_m=3000.0, suav_m=200.0, k=16):
+    """Campo suave de correção R(x,y) (m) pra os planos "responderem" aos furos.
+
+    Por quê: o plano das formações erra os topos medidos nos furos por ~60-70 m
+    (desvio padrão; até ~250 m), e esse erro é QUASE O MESMO em todas as
+    unidades do mesmo furo (correlação 0,84-0,95 entre Irati/Palermo/Rio
+    Bonito/Teresina/Taciba) -- ou seja, a pilha toda sobe/desce junta (relevo
+    estrutural/blocos), não é ruído de cada contato. Então a correção é UMA só
+    por ponto (resíduo médio das unidades medidas naquele furo), somada igual
+    a todas as formações: as camadas continuam paralelas (nunca se cruzam) e
+    mantêm a espessura -- é isso que impede a correção de "vazar" entre camadas.
+
+    Interpolação: IDW com um peso-fantasma de valor 0 (w0 = 1/raio_m²), então
+    a correção vale ~o resíduo perto do furo e decai suavemente pra 0 longe
+    dele (~metade a `raio_m`, ~20% a 2x) -- longe de furo o modelo volta a ser
+    o plano. Validação leave-one-out: RMS do erro cai de ~61 m pra ~39 m."""
+    from scipy.spatial import cKDTree
+    x = furos["E"].to_numpy(float)
+    y = furos["N"].to_numpy(float)
+    res = []
+    for u in UNIDADES_ESTILIZADO:
+        col = MAPA_ALT_TOPO_POR_UNIDADE.get(u)
+        if col and planos.get(u) is not None and col in furos.columns:
+            res.append(furos[col].to_numpy(float) - avaliar_plano(planos[u], x, y))
+    if not res:
+        return lambda xs, ys: np.zeros(np.shape(xs))
+    r = np.nanmean(np.vstack(res), axis=0)
+    ok = ~np.isnan(r)
+    pts, r = np.column_stack([x, y])[ok], r[ok]
+    arvore = cKDTree(pts)
+    kk = min(k, len(r))
+    w0 = 1.0 / raio_m ** 2
+    print(f"[info] correção por furos: {len(r)} furos, resíduo médio {r.mean():+.1f} m, desvio {r.std():.0f} m (raio {raio_m / 1000:.0f} km)")
+
+    def campo(xs, ys):
+        forma = np.shape(xs)
+        P = np.column_stack([np.ravel(xs), np.ravel(ys)]).astype(float)
+        d, i = arvore.query(P, k=kk, distance_upper_bound=2.5 * raio_m)
+        if kk == 1:
+            d, i = d[:, None], i[:, None]
+        valido = np.isfinite(d)
+        w = np.where(valido, 1.0 / (np.where(valido, d, 0) + suav_m) ** 2, 0.0)
+        rv = np.where(valido, r[np.where(valido, i, 0)], 0.0)
+        return ((w * rv).sum(axis=1) / (w.sum(axis=1) + w0)).reshape(forma)
+    return campo
+
+
+def plano_z(planos, unidade, xs, ys):
+    """Elevação do topo da formação em (xs, ys): plano ajustado + correção dos furos."""
+    return avaliar_plano(planos[unidade], xs, ys) + planos["_residuo"](xs, ys)
 
 
 def calcular_contatos_estilizados(planos, terreno, grid_e, grid_n):
@@ -407,7 +460,7 @@ def calcular_contatos_estilizados(planos, terreno, grid_e, grid_n):
     contatos = {}
     corte_atual = terreno.copy()
     for unidade in UNIDADES_ESTILIZADO:
-        plano = avaliar_plano(planos[unidade], grid_e, grid_n)
+        plano = plano_z(planos, unidade, grid_e, grid_n)
         corte_atual = np.minimum(corte_atual, plano)
         contatos[unidade] = corte_atual.copy()
     return contatos
