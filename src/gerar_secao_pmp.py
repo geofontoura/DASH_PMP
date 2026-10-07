@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 import plotly.graph_objects as go
 import plotly.io as pio
+import shapely
 from PIL import Image
 from plotly.subplots import make_subplots
 
@@ -37,7 +38,7 @@ from _comum_pmp import (
     carregar_sills_individualizados, construir_interpolador, avaliar_interpolador, avaliar_plano,
     calcular_planos_estilizados, poligono_para_scatter_xy, pontos_dentro_poligono,
     tema_claro, tema_escuro, adicionar_escala_e_norte, quantizar,
-    obter_satelite_utm, preparar_furos, _intervalos_corpo,
+    obter_satelite_utm, preparar_furos, _intervalos_corpo, carregar_linhas_secao,
 )
 
 BASE = Path(__file__).resolve().parent
@@ -51,6 +52,7 @@ PASSO_POSICAO_M = 1_500.0  # area nova e bem menor (~26x47km) -- passo mais fino
 N_AMOSTRAS_LINHA = 150
 RESOLUCAO_MAPA = 140
 RAIO_MASCARA_KM = 3.0
+N_AMOSTRAS_SECAO_FIXA = 260   # pontos ao longo de cada linha A-D (polilinha)
 BUFFER_FUROS_M = 1_500.0   # furos até essa distância da linha de corte aparecem no perfil
 PLOTLY_CDN = f"https://cdn.plot.ly/plotly-{__import__('plotly').offline.get_plotlyjs_version()}.min.js"
 NOMES_CLASSES_FURO = [n for _, n, _ in ORDEM_PROFUNDIDADE_FURO] + ["sem topos medidos", "corpo intrusivo"]
@@ -158,6 +160,59 @@ def furos_no_perfil(F, dx, dy, px, py, t, cx, cy, s0):
     return dict(base=base, cls=cls)
 
 
+def furos_na_polilinha(F, linha):
+    """Como furos_no_perfil, mas pra uma polilinha (seção A-D): a distância no
+    perfil é o comprimento ao longo da linha até a projeção do furo, e o
+    critério de inclusão é a distância perpendicular à polilinha."""
+    n_cls = len(NOMES_CLASSES_FURO)
+    cls = [([], [], []) for _ in range(n_cls)]
+    for i in range(len(F["x"])):
+        pt = shapely.Point(F["x"][i], F["y"][i])
+        if linha.distance(pt) > BUFFER_FUROS_M:
+            continue
+        d = round(float(linha.project(pt)) / 1000, 3)
+        z0, nome = F["z0"][i], F["nome"][i]
+        for ini, fim, k in F["segs"][i]:
+            cls[k][0].extend([d, d, None]); cls[k][1].extend([round(z0 - ini, 1), round(z0 - fim, 1), None])
+            cls[k][2].extend([f"<b>{nome}</b><br>{NOMES_CLASSES_FURO[k]}: {ini:.0f}–{fim:.0f} m", None, None])
+        for a, b in F["corpos"][i]:
+            k = n_cls - 1
+            cls[k][0].extend([d, d, None]); cls[k][1].extend([round(z0 - a, 1), round(z0 - b, 1), None])
+            cls[k][2].extend([f"<b>{nome}</b><br>corpo intrusivo: {a:.1f}–{b:.1f} m ({b - a:.1f} m)", None, None])
+    base = ([v for c in cls for v in c[0]], [v for c in cls for v in c[1]], [None] * sum(len(c[0]) for c in cls))
+    return dict(base=base, cls=cls)
+
+
+def secao_na_polilinha(linha, interp_terreno, planos, sills, furos):
+    """Perfil ao longo de uma polilinha (seção A-D): mesmas camadas da seção
+    rotacionável (terreno real, formações em cascata de erosão, sill onde a
+    linha cruza o polígono mapeado, furos projetados)."""
+    comp = float(linha.length)
+    d_m = np.linspace(0.0, comp, N_AMOSTRAS_SECAO_FIXA)
+    pts = shapely.line_interpolate_point(linha, d_m)
+    xs, ys = shapely.get_x(pts), shapely.get_y(pts)
+    dists = quantizar(d_m / 1000, 3)
+    terreno = avaliar_interpolador(interp_terreno, xs, ys, raio_mascara_km=RAIO_MASCARA_KM)
+    contatos, corte = {}, terreno.copy()
+    for unidade in UNIDADES_ESTILIZADO:
+        corte = np.minimum(corte, avaliar_plano(planos[unidade], xs, ys))
+        contatos[unidade] = corte.copy()
+    bandas = {}
+    for i, unidade in enumerate(UNIDADES_ESTILIZADO):
+        topo = contatos[unidade]
+        base = contatos[UNIDADES_ESTILIZADO[i + 1]] if i + 1 < len(UNIDADES_ESTILIZADO) else topo - 300.0
+        bandas[unidade] = (np.concatenate([dists, dists[::-1]]), np.concatenate([quantizar(topo, 1), quantizar(base, 1)[::-1]]))
+    dentro = np.zeros_like(xs, dtype=bool)
+    for _, geom_sill in sills:
+        dentro |= pontos_dentro_poligono(xs, ys, geom_sill)
+    sx, sy = banda_mascarada(dists, quantizar(terreno, 1), quantizar(terreno - ESPESSURA_SILL_M, 1), dentro)
+    vx, vy = np.array(linha.coords)[:, 0], np.array(linha.coords)[:, 1]
+    return dict(
+        terreno=(dists, quantizar(terreno, 1)), linha_mapa=(quantizar(vx, 0), quantizar(vy, 0)),
+        bandas=bandas, sill=(sx, sy), furos=furos_na_polilinha(furos, linha),
+    ), comp / 1000
+
+
 def main():
     poligono, bounds = carregar_area_pmp()
     e_min, n_min, e_max, n_max = bounds
@@ -243,6 +298,25 @@ def main():
             ))
         todas_secoes.append(secoes_angulo)
 
+    # --- seções fixas A-D (linhas desenhadas pelo usuário em secao*.shp)
+    linhas_secao = carregar_linhas_secao()
+    secoes_fixas = []
+    for nome_l, geom_l in linhas_secao:
+        # o modelo só existe dentro do retângulo (area2.shp): recorta a linha nele; se ela sai e volta,
+        # fica o trecho mais longo (fora da área não há terreno/planos confiáveis e o perfil quebraria)
+        recorte = shapely.intersection(geom_l, poligono)
+        pedacos = [g for g in getattr(recorte, "geoms", [recorte]) if g.geom_type == "LineString" and g.length > 0]
+        if not pedacos:
+            print(f"[aviso] linha {nome_l} não cruza a área -- ignorada"); continue
+        if len(pedacos) > 1:
+            pedacos = [shapely.line_merge(shapely.MultiLineString(pedacos))] if shapely.line_merge(shapely.MultiLineString(pedacos)).geom_type == "LineString" else [max(pedacos, key=lambda g: g.length)]
+        if recorte.length < geom_l.length - 1:
+            print(f"[info] linha {nome_l}: {geom_l.length / 1000:.1f} km -> {pedacos[0].length / 1000:.1f} km dentro da área")
+        geom_l = pedacos[0]
+        sec, comp_km = secao_na_polilinha(geom_l, interp_terreno, planos, sills, furos)
+        secoes_fixas.append(dict(nome=nome_l, compKm=round(comp_km, 3), secao=sec, vertices=[(float(x), float(y)) for x, y in np.array(geom_l.coords)[:, :2]]))
+    print(f"[info] seções fixas: " + ", ".join(f"{d['nome']} ({d['compKm']:.1f} km)" for d in secoes_fixas))
+
     # --- figura: mapa (row1,col1) + perfil (row1,col2) ---
     fig = make_subplots(rows=1, cols=2, column_widths=[0.34, 0.66], horizontal_spacing=0.05)
 
@@ -268,6 +342,17 @@ def main():
         x=furos["x"], y=furos["y"], mode="markers", name="Furos", showlegend=False, text=furos["hover"],
         hovertemplate="%{text}<extra></extra>", marker=dict(size=6, color=furos["cor"], line=dict(width=1, color=MARCA_NAVY)),
     ), row=1, col=1)
+
+    # as 4 linhas A-D sempre visíveis no mapa (tracejado claro, rótulo na ponta inicial e final)
+    lx, ly, lt = [], [], []
+    for d in secoes_fixas:
+        for (x, y) in d["vertices"]:
+            lx.append(x); ly.append(y); lt.append("")
+        lt[-len(d["vertices"])] = d["nome"]
+        lt[-1] = d["nome"] + "'"
+        lx.append(None); ly.append(None); lt.append("")
+    fig.add_trace(go.Scatter(x=lx, y=ly, text=lt, mode="lines+text", line=dict(color="rgba(255,255,255,.75)", width=1.6, dash="dot"),
+                              textposition="top center", textfont=dict(size=12, color="#FFFFFF"), showlegend=False, hoverinfo="skip"), row=1, col=1)
 
     n_pos_inicial = len(angulos_info[0]["t_vals"])
     p0 = n_pos_inicial // 2
@@ -320,26 +405,31 @@ def main():
 
     ordem_frame = (["linha_mapa"] + UNIDADES_ESTILIZADO + ["sill", "terreno", "furos_base"]
                    + [f"furos_{k}" for k in range(len(NOMES_CLASSES_FURO))])
+    def montar_dados_frame(secao):
+        dados = []
+        for chave in ordem_frame:
+            text = None
+            if chave == "linha_mapa":
+                x, y = secao["linha_mapa"]
+            elif chave == "terreno":
+                x, y = secao["terreno"]
+            elif chave == "sill":
+                x, y = secao["sill"]
+            elif chave == "furos_base":
+                x, y, _ = secao["furos"]["base"]
+            elif chave.startswith("furos_"):
+                x, y, text = secao["furos"]["cls"][int(chave.split("_")[1])]
+            else:
+                x, y = secao["bandas"][chave]
+            dados.append(go.Scatter(x=x, y=y, text=text) if text is not None else go.Scatter(x=x, y=y))
+        return dados
+
     frames = []
     for a, secoes_angulo in enumerate(todas_secoes):
         for p, secao in enumerate(secoes_angulo):
-            dados_frame = []
-            for chave in ordem_frame:
-                text = None
-                if chave == "linha_mapa":
-                    x, y = secao["linha_mapa"]
-                elif chave == "terreno":
-                    x, y = secao["terreno"]
-                elif chave == "sill":
-                    x, y = secao["sill"]
-                elif chave == "furos_base":
-                    x, y, _ = secao["furos"]["base"]
-                elif chave.startswith("furos_"):
-                    x, y, text = secao["furos"]["cls"][int(chave.split("_")[1])]
-                else:
-                    x, y = secao["bandas"][chave]
-                dados_frame.append(go.Scatter(x=x, y=y, text=text) if text is not None else go.Scatter(x=x, y=y))
-            frames.append(go.Frame(data=dados_frame, name=f"{a}_{p}", traces=idx_traces_frame))
+            frames.append(go.Frame(data=montar_dados_frame(secao), name=f"{a}_{p}", traces=idx_traces_frame))
+    for i, d in enumerate(secoes_fixas):
+        frames.append(go.Frame(data=montar_dados_frame(d["secao"]), name=f"L_{i}", traces=idx_traces_frame))
     fig.frames = frames
 
     # --- tudo que é controle fica FORA do plot (barra HTML no topo); o plot só tem mapa + perfil
@@ -377,11 +467,14 @@ def main():
                    claro=dict(paper=tema_claro()["paper_bgcolor"], plot=tema_claro()["plot_bgcolor"], font=tema_claro()["font_color"],
                               grid=tema_claro()["grid_color"], axis=tema_claro()["axis_color"])),
         legenda=legenda,
+        secoes=[dict(nome=d['nome'], compKm=d['compKm']) for d in secoes_fixas],
     )
 
     def opcoes(itens):
         return "".join(f'<option value="{i}">{n}</option>' for i, n in enumerate(itens))
 
+    html_botoes_secao = "".join(f'<button class="btn btn-secao" data-i="{i}" title="Seção {d["nome"]} — {d["compKm"]:.1f} km">{d["nome"]}</button>'
+                                for i, d in enumerate(secoes_fixas))
     html_legenda = "".join(
         f'<span class="leg-item" data-i="{i}"><i style="background:{it["cor"]}"></i>{it["nome"]}</span>' for i, it in enumerate(legenda))
     html_furos_leg = "".join(f'<span class="leg-fixo"><i style="background:{it["cor"]}"></i>{it["nome"]}</span>' for it in furos_legenda)
@@ -397,7 +490,7 @@ def main():
         "@@OPC_ANGULO@@": opcoes([a["nome"] for a in cfg["angulos"]]),
         "@@OPC_MAPA@@": opcoes([m["nome"] for m in modos_mapa]),
         "@@NPOS@@": str(len(angulos_info[0]["t_vals"]) - 1), "@@P0@@": str(p0),
-        "@@LEGENDA@@": html_legenda, "@@FUROS_LEG@@": html_furos_leg,
+        "@@BOTOES_SECAO@@": html_botoes_secao, "@@LEGENDA@@": html_legenda, "@@FUROS_LEG@@": html_furos_leg,
         "@@GRAFICO@@": grafico,
     }.items():
         html = html.replace(token, valor)
@@ -411,27 +504,58 @@ POST_JS = r"""
 (function() {
     var C = @@CFG@@;
     var gd = document.getElementById('secao');
-    var anguloAtual = 0, posAtual = C.p0, furosOn = true;
+    var anguloAtual = 0, posAtual = C.p0, furosOn = true, secaoFixa = null;
     var sl = document.getElementById('corte-pos'), lab = document.getElementById('corte-val');
+    var botoesSecao = document.querySelectorAll('.btn-secao');
     var OPT = {mode: 'immediate', frame: {duration: 0, redraw: true}, transition: {duration: 0}};
 
     function rotulo(a, p) { var v = C.angulos[a].t[p]; return (v >= 0 ? '+' : '') + v.toFixed(0) + ' m'; }
+    function marcarSecao(i) {
+        secaoFixa = i;
+        botoesSecao.forEach(function(b) { b.classList.toggle('ativo', +b.getAttribute('data-i') === i); });
+        sl.classList.toggle('apagado', i !== null);
+    }
+    // volta pra linha de corte rotacionável (sai da seção A-D)
+    function sairSecao() {
+        if (secaoFixa === null) return;
+        marcarSecao(null);
+        Plotly.relayout(gd, {'xaxis2.range': [0, C.angulos[anguloAtual].compKm]});
+    }
     function irPara(a, p) {
         anguloAtual = a; posAtual = p; sl.value = p; lab.textContent = rotulo(a, p);
         Plotly.animate(gd, [a + '_' + p], OPT).catch(function() {});
     }
+    function irSecao(i) {
+        marcarSecao(i);
+        var s = C.secoes[i];
+        lab.textContent = 'Seção ' + s.nome + ' · ' + s.compKm.toFixed(1) + ' km';
+        Plotly.relayout(gd, {'xaxis2.range': [0, s.compKm]});
+        Plotly.animate(gd, ['L_' + i], OPT).catch(function() {});
+    }
+    botoesSecao.forEach(function(b) {
+        b.addEventListener('click', function() {
+            var i = +b.getAttribute('data-i');
+            if (secaoFixa === i) { sairSecao(); irPara(anguloAtual, posAtual); } else { irSecao(i); }
+        });
+    });
+
     document.getElementById('sel-angulo').addEventListener('change', function(ev) {
         var a = +ev.target.value, n = C.angulos[a].t.length;
+        marcarSecao(null);
         sl.max = n - 1;
         Plotly.relayout(gd, {'xaxis2.range': [0, C.angulos[a].compKm]});
         irPara(a, Math.floor(n / 2));
     });
-    sl.addEventListener('input', function() { irPara(anguloAtual, +sl.value); });
+    sl.addEventListener('input', function() {
+        if (secaoFixa !== null) { marcarSecao(null); Plotly.relayout(gd, {'xaxis2.range': [0, C.angulos[anguloAtual].compKm]}); }
+        irPara(anguloAtual, +sl.value);
+    });
 
-    // clique no mapa move a linha de corte
+    // clique no mapa move a linha de corte (e sai da seção A-D)
     gd.on('plotly_click', function(data) {
         var pt = data.points[0];
         if (!(pt.curveNumber >= 0 && pt.curveNumber <= C.idxMapaMax)) return;
+        if (secaoFixa !== null) { marcarSecao(null); Plotly.relayout(gd, {'xaxis2.range': [0, C.angulos[anguloAtual].compKm]}); }
         var info = C.angulos[anguloAtual];
         var t = (pt.x - C.cx) * info.px + (pt.y - C.cy) * info.py, melhor = 0, dmin = Infinity;
         for (var p = 0; p < info.t.length; p++) { var d = Math.abs(info.t[p] - t); if (d < dmin) { dmin = d; melhor = p; } }
@@ -504,6 +628,8 @@ TEMPLATE = r"""<!DOCTYPE html>
   .btn:hover { opacity: 1; }
   .btn.ativo { opacity: 1; background: @@ROXO@@; color: #fff; }
   input[type=range] { accent-color: @@ROXO@@; width: 280px; }
+  .btn-secao { min-width: 34px; font-weight: 700; padding: 5px 11px; }
+  input[type=range].apagado { opacity: .4; }
   #corte-val { min-width: 62px; font-variant-numeric: tabular-nums; font-weight: 600; }
   #legenda { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; padding: 8px 20px 10px; font-size: 11.5px; flex-shrink: 0; border-bottom: 1px solid var(--borda); }
   .leg-item, .leg-fixo { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
@@ -524,6 +650,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 <div id="barra">
   <div class="grupo"><span class="rot">Linha de corte</span><select id="sel-angulo">@@OPC_ANGULO@@</select></div>
   <div class="grupo"><span class="rot">Mapa</span><select id="sel-mapa">@@OPC_MAPA@@</select></div>
+  <div class="grupo"><span class="rot">Seções</span>@@BOTOES_SECAO@@</div>
   <div class="grupo"><span class="rot">Furos</span><button class="btn ativo" id="b-furos">Furos: ON</button></div>
   <div class="grupo"><span class="rot">Posição do corte</span><input type="range" id="corte-pos" min="0" max="@@NPOS@@" step="1" value="@@P0@@"><span id="corte-val"></span><span style="opacity:.55">ou clique no mapa</span></div>
   <div class="grupo"><span class="rot">Tema</span><button class="btn ativo" data-tema="escuro">Escuro</button><button class="btn" data-tema="claro">Claro</button></div>

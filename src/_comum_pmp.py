@@ -1064,3 +1064,26 @@ def amostrar_satelite_rgb(raster, bounds, xs, ys):
     col = np.clip(((np.asarray(xs) - e0) / (e1 - e0) * (w - 1)).round().astype(int), 0, w - 1)
     row = np.clip(((n1 - np.asarray(ys)) / (n1 - n0) * (h - 1)).round().astype(int), 0, h - 1)
     return np.stack([raster[0, row, col], raster[1, row, col], raster[2, row, col]], axis=-1)
+
+
+def carregar_linhas_secao():
+    """Linhas de seção A-D desenhadas pelo usuário em 2_Banco_de_Dados/secao*.shp
+    (polilinhas, coluna 'nome') -> lista de (nome, LineString 2D em UTM 22S), em
+    ordem de nome. Se houver mais de um secao*.shp (secao.shp, secao1.shp...),
+    usa o modificado por último. Linhas sem nome viram 'L1', 'L2'..."""
+    import shapely
+    candidatos = sorted(AREA_PMP_SHP.parent.glob("secao*.shp"), key=lambda q: q.stat().st_mtime, reverse=True)
+    if not candidatos:
+        return []
+    gdf = gpd.read_file(candidatos[0]).to_crs("EPSG:31982")
+    linhas = []
+    for i, r in enumerate(gdf.itertuples(), start=1):
+        nome = str(getattr(r, "nome", "") or "").strip() or f"L{i}"
+        geom = shapely.force_2d(r.geometry)
+        if geom.geom_type == "MultiLineString":
+            geom = shapely.line_merge(geom)
+        if geom.geom_type != "LineString":
+            continue
+        linhas.append((nome, geom))
+    print(f"[info] linhas de seção: {', '.join(n for n, _ in sorted(linhas))} (de {candidatos[0].name})")
+    return sorted(linhas, key=lambda t: t[0])
