@@ -37,7 +37,7 @@ from _comum_pmp import (
     CORES_ESTILIZADO, ESPESSURA_ESTILIZADO_M, ESPESSURA_SILL_M, ORDEM_PROFUNDIDADE_FURO,
     COR_FURO_SEM_TOPO, ROTULO_FURO_SEM_TOPO, LEAFLET_LINKS, JS_BASEMAPS, logo_base64,
     gerar_hipsometria_leaflet, preparar_geologia_leaflet, preparar_contorno_area_leaflet, preparar_furos,
-    carregar_litologia_pmp, SIGLAS_SILL_INDIVIDUALIZADO, _intervalos_corpo,
+    carregar_litologia_pmp, SIGLAS_SILL_INDIVIDUALIZADO, _intervalos_corpo, espessuras_sills,
 )
 
 BASE = Path(__file__).resolve().parent
@@ -232,8 +232,11 @@ def montar_graficos(f):
                                  hovertemplate="%{x} m: %{y} furos<extra></extra>", name="Corpo intrusivo"))
     fig.add_vline(x=float(e.median()), line=dict(color="#E8A33D", dash="dash"),
                   annotation_text=f"mediana {e.median():.1f} m", annotation_font=dict(color="#E8A33D", size=10), annotation_position="top right")
-    fig.add_vline(x=ESPESSURA_SILL_M, line=dict(color="#7B2FFF", dash="dot"),
-                  annotation_text=f"assumido no cubo: {ESPESSURA_SILL_M:.0f} m", annotation_font=dict(color="#B98CFF", size=10), annotation_position="bottom right")
+    for k_, (nome_s, d_s) in enumerate(espessuras_sills().items()):
+        if d_s["medida"]:   # espessura que o cubo e a seção usam pra cada sill (mediana dos furos dentro do corpo)
+            fig.add_vline(x=d_s["esp"], line=dict(color="#7B2FFF", dash="dot"),
+                          annotation_text=f"{nome_s}: {d_s['esp']:.0f} m (usado no modelo)", annotation_font=dict(color="#B98CFF", size=10),
+                          annotation_position="top right" if k_ % 2 else "bottom right")
     fig.update_xaxes(title_text="Espessura do corpo intrusivo (m)"); fig.update_yaxes(title_text="Nº de furos")
     graficos["corpo"] = tema_grafico(fig, "Espessura do corpo intrusivo interceptado nos furos", 300,
                                       f"{len(e)} furos · intervalo mais espesso de cada furo (Prof_corpos_intrusivos_SG)")
@@ -352,7 +355,7 @@ TEMPLATE = r"""<!DOCTYPE html>
         <thead><tr><th>Corpo</th><th>Área</th><th>Pol.</th><th>Furos</th><th>c/ corpo</th><th>Esp. med.</th><th>Máx</th></tr></thead>
         <tbody>@@RESUMO@@</tbody>
       </table>
-      <p class="nota-resumo">Área do polígono CPRM · "Furos" = furos dentro do polígono · "c/ corpo" = os que interceptaram corpo intrusivo · espessura = intervalo mais espesso por furo (mediana e máx). O cubo assume @@ESP_SILL@@ m.</p>
+      <p class="nota-resumo">Área do polígono CPRM · "Furos" = furos dentro do polígono · "c/ corpo" = os que interceptaram corpo intrusivo · espessura = intervalo mais espesso por furo (mediana e máx). @@ESP_SILL@@</p>
     </div>
   </div>
   <div class="painel col-graficos">
@@ -723,8 +726,18 @@ def esc(s):
     return "" if s is None or (isinstance(s, float) and np.isnan(s)) else str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
+def _esp_sill_txt():
+    d = espessuras_sills()
+    med = [f"{n} {v['esp']:.0f} m" for n, v in d.items() if v["medida"]]
+    ass = [f"{n} {v['esp']:.0f} m" for n, v in d.items() if not v["medida"]]
+    t = "O modelo (cubo e seção) usa a mediana medida: " + ", ".join(med)
+    return t + (f"; sem furo dentro, assumido: {', '.join(ass)}." if ass else ".")
+
+
 def main():
     print("Carregando dados...")
+    global ESP_SILL_TXT
+    ESP_SILL_TXT = _esp_sill_txt()
     f = preparar_furos()
     f = f[f["tipo"] == "Furo"].reset_index(drop=True)  # afloramentos (sem código de furo) ficam só no webmap
     print(f"  {len(f)} furos ({int((f['n_corpos'] > 0).sum())} com corpo intrusivo)")
@@ -808,7 +821,7 @@ def main():
         "@@FONTE@@": MARCA_FONTE, "@@NAVY@@": MARCA_NAVY, "@@ROXO@@": MARCA_ROXO, "@@ROXO_ESCURO@@": MARCA_ROXO_ESCURO,
         "@@CINZA@@": MARCA_CINZA_CLARO, "@@PAINEL@@": COR_PAINEL, "@@DESTAQUE@@": COR_DESTAQUE_CORPO,
         "@@LOGO@@": f'<img src="data:image/jpeg;base64,{logo}">' if logo else "",
-        "@@TABELA@@": "".join(linhas), "@@RESUMO@@": resumo_corpos(f), "@@ESP_SILL@@": f"{ESPESSURA_SILL_M:.0f}",
+        "@@TABELA@@": "".join(linhas), "@@RESUMO@@": resumo_corpos(f), "@@ESP_SILL@@": ESP_SILL_TXT,
         "@@CARDS@@": cards, "@@GD_IDS@@": ",".join(f'"grafico-{k}"' for k in ids),
         "@@STAT_TOPOS@@": linhas_estatistica(n_topos, 0),
         "@@STAT_ESP@@": linhas_estatistica([(k, v[0]) for k, v in esp.items()], 0),

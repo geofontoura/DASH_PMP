@@ -39,7 +39,7 @@ from _comum_pmp import (
     UNIDADES_ESTILIZADO, NOMES_ESTILIZADO, CORES_ESTILIZADO, ESPESSURA_SILL_M,
     ORDEM_PROFUNDIDADE_FURO, CORES_HIPSOMETRICAS, COR_POR_SIGLA, COR_LITOLOGIA_PADRAO,
     logo_base64, carregar_area_pmp, carregar_vertices_curvas_pmp, carregar_litologia_pmp,
-    carregar_sills_individualizados, construir_interpolador, avaliar_interpolador,
+    carregar_sills_individualizados, espessuras_sills, construir_interpolador, avaliar_interpolador,
     pontos_dentro_poligono, calcular_planos_estilizados, calcular_contatos_estilizados,
     obter_satelite_utm, amostrar_satelite_rgb, preparar_furos, _intervalos_corpo, _hex_rgb,
     LEAFLET_LINKS,
@@ -115,6 +115,7 @@ def montar_dados():
     # --- sills: grade própria em cima do bbox do polígono; topo = terreno, base = terreno - espessura
     terr_bilin = RegularGridInterpolator((ys, xs), terreno, bounds_error=False, fill_value=None)
     sills = []
+    esp_sills = espessuras_sills()   # espessura MEDIDA nos furos por corpo (50 m só onde não há furo)
     for nome, geom in carregar_sills_individualizados():
         g0, h0, g1, h1 = geom.bounds
         nx = int(min(MAX_NOS_SILL, max(8, np.ceil((g1 - g0) / PASSO_SILL_M))))
@@ -124,7 +125,7 @@ def montar_dados():
         dentro = pontos_dentro_poligono(se, sn, geom.buffer(PASSO_SILL_M / 2))
         zt_ = terr_bilin(np.column_stack([sn.ravel(), se.ravel()])).reshape(se.shape)
         top = np.where(dentro, zt_ + OFFSET_SILL_M, np.nan)
-        base = np.where(dentro, zt_ - ESPESSURA_SILL_M, np.nan)
+        base = np.where(dentro, zt_ - esp_sills[nome]["esp"], np.nan)
         sills.append(dict(nome=f"Sill — {nome}", cor=CORES_ESTILIZADO["Gp_SerraGeral"], xs=[round(float(v), 1) for v in sx],
                           ys=[round(float(v), 1) for v in sy], top=b64(top, np.float32), base=b64(base, np.float32)))
 

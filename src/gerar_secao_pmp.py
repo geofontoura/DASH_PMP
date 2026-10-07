@@ -35,7 +35,7 @@ from _comum_pmp import (
     UNIDADES_ESTILIZADO, NOMES_ESTILIZADO, CORES_ESTILIZADO, ESPESSURA_SILL_M,
     COR_POR_SIGLA, SIGLAS_SILL_INDIVIDUALIZADO, ORDEM_PROFUNDIDADE_FURO,
     logo_base64, carregar_area_pmp, carregar_vertices_curvas_pmp, carregar_litologia_pmp,
-    carregar_sills_individualizados, construir_interpolador, avaliar_interpolador, avaliar_plano, plano_z,
+    carregar_sills_individualizados, sills_nos_pontos, construir_interpolador, avaliar_interpolador, avaliar_plano, plano_z,
     calcular_planos_estilizados, poligono_para_scatter_xy, pontos_dentro_poligono,
     tema_claro, tema_escuro, adicionar_escala_e_norte, quantizar,
     obter_satelite_utm, preparar_furos, _intervalos_corpo, carregar_linhas_secao,
@@ -221,10 +221,8 @@ def secao_na_polilinha(linha, interp_terreno, planos, sills, furos):
         topo = contatos[unidade]
         base = contatos[UNIDADES_ESTILIZADO[i + 1]] if i + 1 < len(UNIDADES_ESTILIZADO) else avaliar_plano(planos[unidade], xs, ys) - 450.0
         bandas[unidade] = (np.concatenate([dists, dists[::-1]]), np.concatenate([quantizar(topo, 1), quantizar(base, 1)[::-1]]))
-    dentro = np.zeros_like(xs, dtype=bool)
-    for _, geom_sill in sills:
-        dentro |= pontos_dentro_poligono(xs, ys, geom_sill)
-    sx, sy = banda_mascarada(dists, quantizar(terreno, 1), quantizar(terreno - ESPESSURA_SILL_M, 1), dentro)
+    dentro, esp_sill = sills_nos_pontos(xs, ys, sills)   # espessura medida nos furos, por corpo
+    sx, sy = banda_mascarada(dists, quantizar(terreno, 1), quantizar(terreno - esp_sill, 1), dentro)
     vx, vy = np.array(linha.coords)[:, 0], np.array(linha.coords)[:, 1]
     return dict(
         terreno=(dists, quantizar(terreno, 1)), linha_mapa=(quantizar(vx, 0), quantizar(vy, 0)),
@@ -300,13 +298,11 @@ def main():
             # contatos erodidos de Fm_SerraAlta/Fm_Teresina dava espessura
             # ZERO (os dois colapsam pro mesmo terreno onde o sill aflora,
             # exatamente o ponto que o polígono marca) -- topo = terreno,
-            # base = terreno - ESPESSURA_SILL_M, só onde a linha passa DENTRO
+            # base = terreno - espessura medida do corpo, só onde a linha passa DENTRO
             # do polígono real do corpo
             topo_sill = terreno
-            base_sill = terreno - ESPESSURA_SILL_M
-            dentro_algum_sill = np.zeros_like(xs, dtype=bool)
-            for _, geom_sill in sills:
-                dentro_algum_sill |= pontos_dentro_poligono(xs, ys, geom_sill)
+            dentro_algum_sill, esp_sill = sills_nos_pontos(xs, ys, sills)   # espessura medida nos furos, por corpo
+            base_sill = terreno - esp_sill
             sx, sy = banda_mascarada(dists, quantizar(topo_sill, 1), quantizar(base_sill, 1), dentro_algum_sill)
 
             secoes_angulo.append(dict(

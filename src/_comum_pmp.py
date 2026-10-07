@@ -1140,3 +1140,51 @@ def carregar_linhas_secao():
         linhas.append((nome, geom))
     print(f"[info] linhas de seção: {', '.join(n for n, _ in sorted(linhas))} (de {candidatos[0].name})")
     return sorted(linhas, key=lambda t: t[0])
+
+
+# =====================================================================
+# Espessura dos sills MEDIDA nos furos (em vez dos 50 m fixos assumidos)
+# =====================================================================
+MIN_FUROS_ESPESSURA_SILL = 3   # menos furos que isso -> volta pra ESPESSURA_SILL_M (assunção)
+_CACHE_ESP_SILL = {}
+
+
+def espessuras_sills():
+    """{nome_do_sill: dict(esp=m, n=nº de furos, medida=bool)}.
+    Para cada sill mapeado (polígono CPRM), mediana do intervalo de corpo
+    intrusivo mais espesso de cada furo DENTRO do polígono
+    (Prof_corpos_intrusivos_SG). Com menos de MIN_FUROS_ESPESSURA_SILL furos
+    (hoje só o Urussanga, sem nenhum), usa ESPESSURA_SILL_M como assunção."""
+    if _CACHE_ESP_SILL:
+        return _CACHE_ESP_SILL
+    f = preparar_furos()
+    f = f[f["tipo"] == "Furo"]
+    por_nome = {}
+    for nome, geom in carregar_sills_individualizados():
+        por_nome.setdefault(nome, []).append(geom)
+    for nome, geoms in por_nome.items():
+        g = shapely.union_all(geoms)
+        dentro = shapely.contains_xy(g, f["E"].to_numpy(float), f["N"].to_numpy(float))
+        esp = f.loc[dentro, "esp_corpo_m"].dropna()
+        if len(esp) >= MIN_FUROS_ESPESSURA_SILL:
+            _CACHE_ESP_SILL[nome] = dict(esp=float(esp.median()), n=int(len(esp)), medida=True)
+        else:
+            _CACHE_ESP_SILL[nome] = dict(esp=float(ESPESSURA_SILL_M), n=int(len(esp)), medida=False)
+    print("[info] espessura dos sills: " + "; ".join(
+        f"{n} {d['esp']:.0f} m ({'mediana de ' + str(d['n']) + ' furos' if d['medida'] else 'assumido, ' + str(d['n']) + ' furos'})"
+        for n, d in _CACHE_ESP_SILL.items()))
+    return _CACHE_ESP_SILL
+
+
+def sills_nos_pontos(xs, ys, sills):
+    """(dentro, esp): máscara dos pontos dentro de algum sill e a espessura (m)
+    do sill em cada um (NaN fora). `sills` = carregar_sills_individualizados()."""
+    esp_map = espessuras_sills()
+    xs, ys = np.asarray(xs, float), np.asarray(ys, float)
+    dentro = np.zeros(xs.shape, dtype=bool)
+    esp = np.full(xs.shape, np.nan)
+    for nome, geom in sills:
+        m = pontos_dentro_poligono(xs, ys, geom)
+        esp[m] = esp_map[nome]["esp"]
+        dentro |= m
+    return dentro, esp
