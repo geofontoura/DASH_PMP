@@ -208,7 +208,7 @@ def secao_na_polilinha(linha, interp_terreno, planos, sills, furos):
     bandas = {}
     for i, unidade in enumerate(UNIDADES_ESTILIZADO):
         topo = contatos[unidade]
-        base = contatos[UNIDADES_ESTILIZADO[i + 1]] if i + 1 < len(UNIDADES_ESTILIZADO) else topo - 300.0
+        base = contatos[UNIDADES_ESTILIZADO[i + 1]] if i + 1 < len(UNIDADES_ESTILIZADO) else avaliar_plano(planos[unidade], xs, ys) - 300.0
         bandas[unidade] = (np.concatenate([dists, dists[::-1]]), np.concatenate([quantizar(topo, 1), quantizar(base, 1)[::-1]]))
     dentro = np.zeros_like(xs, dtype=bool)
     for _, geom_sill in sills:
@@ -278,7 +278,7 @@ def main():
             bandas = {}
             for i, unidade in enumerate(UNIDADES_ESTILIZADO):
                 topo = contatos[unidade]
-                base = contatos[UNIDADES_ESTILIZADO[i + 1]] if i + 1 < len(UNIDADES_ESTILIZADO) else topo - 300.0
+                base = contatos[UNIDADES_ESTILIZADO[i + 1]] if i + 1 < len(UNIDADES_ESTILIZADO) else avaliar_plano(planos[unidade], xs, ys) - 300.0
                 bandas[unidade] = (
                     np.concatenate([dists, dists[::-1]]),
                     np.concatenate([quantizar(topo, 1), quantizar(base, 1)[::-1]]),
