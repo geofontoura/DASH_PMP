@@ -20,6 +20,7 @@ Gera:
 """
 import base64
 import io
+import json
 from pathlib import Path
 
 import numpy as np
@@ -35,7 +36,7 @@ from _comum_pmp import (
     logo_base64, carregar_area_pmp, carregar_vertices_curvas_pmp, carregar_litologia_pmp,
     carregar_sills_individualizados, construir_interpolador, avaliar_interpolador, avaliar_plano,
     calcular_planos_estilizados, poligono_para_scatter_xy, pontos_dentro_poligono,
-    botoes_tema, tema_escuro, adicionar_escala_e_norte, quantizar,
+    tema_claro, tema_escuro, adicionar_escala_e_norte, quantizar,
     obter_satelite_utm, preparar_furos, _intervalos_corpo,
 )
 
@@ -193,7 +194,7 @@ def main():
         angulos_info.append(dict(nome=nome, dx=dx, dy=dy, px=px, py=py,
                                   s_vals=np.linspace(s_min, s_max, N_AMOSTRAS_LINHA), t_vals=t_vals))
 
-    # --- pre-computa uma secao (bandas de formacao + sill + espessuras) por
+    # --- pre-computa uma secao (bandas de formacao + sill + furos) por
     # combinacao angulo x posicao ---
     todas_secoes = []
     for info in angulos_info:
@@ -212,7 +213,6 @@ def main():
                 contatos[unidade] = corte_atual.copy()
 
             bandas = {}
-            espessuras = []
             for i, unidade in enumerate(UNIDADES_ESTILIZADO):
                 topo = contatos[unidade]
                 base = contatos[UNIDADES_ESTILIZADO[i + 1]] if i + 1 < len(UNIDADES_ESTILIZADO) else topo - 300.0
@@ -220,7 +220,6 @@ def main():
                     np.concatenate([dists, dists[::-1]]),
                     np.concatenate([quantizar(topo, 1), quantizar(base, 1)[::-1]]),
                 )
-                espessuras.append(float(np.nanmean(topo - base)))
 
             # sill: poligono de afloramento = "aqui o sill está exposto na
             # superfície", ou seja terreno real = topo do sill ali -- usar os
@@ -239,18 +238,13 @@ def main():
             secoes_angulo.append(dict(
                 terreno=(dists, quantizar(terreno, 1)),
                 linha_mapa=(quantizar(np.array([xs[0], xs[-1]]), 0), quantizar(np.array([ys[0], ys[-1]]), 0)),
-                bandas=bandas, sill=(sx, sy), espessuras=espessuras,
+                bandas=bandas, sill=(sx, sy),
                 furos=furos_no_perfil(furos, info["dx"], info["dy"], info["px"], info["py"], t, cx, cy, info["s_vals"][0]),
             ))
         todas_secoes.append(secoes_angulo)
 
-    # --- figura: mapa (row1,col1) + perfil (row1,col2) + barras (row2) ---
-    fig = make_subplots(
-        rows=2, cols=2, column_widths=[0.32, 0.68], row_heights=[0.78, 0.22],
-        horizontal_spacing=0.06, vertical_spacing=0.17,
-        specs=[[{}, {}], [{"colspan": 2}, None]],
-        subplot_titles=("Mapa (clique p/ mover o corte)", "Perfil", "Espessura na linha atual"),
-    )
+    # --- figura: mapa (row1,col1) + perfil (row1,col2) ---
+    fig = make_subplots(rows=1, cols=2, column_widths=[0.34, 0.66], horizontal_spacing=0.05)
 
     fig.add_trace(go.Heatmap(x=mx[0, :], y=my[:, 0], z=mz, colorscale="YlOrBr_r", showscale=False, hoverinfo="none"), row=1, col=1)
 
@@ -281,7 +275,7 @@ def main():
 
     idx_linha_mapa = len(fig.data)
     fig.add_trace(go.Scatter(x=inicial["linha_mapa"][0], y=inicial["linha_mapa"][1], mode="lines",
-                              line=dict(color="#FF3B6B", width=2.5, dash="dash"), showlegend=False), row=1, col=1)
+                              line=dict(color="#FF3B6B", width=2.5, dash="dash"), showlegend=False, hoverinfo="skip"), row=1, col=1)
 
     idx_bandas = {}
     for unidade in UNIDADES_ESTILIZADO:
@@ -289,7 +283,7 @@ def main():
         idx_bandas[unidade] = len(fig.data)
         fig.add_trace(go.Scatter(
             x=x, y=y, fill="toself", fillcolor=CORES_ESTILIZADO[unidade], line=dict(width=0), mode="lines",
-            name=NOMES_ESTILIZADO[unidade], showlegend=True,
+            name=NOMES_ESTILIZADO[unidade], showlegend=False,
             hovertemplate=f"{NOMES_ESTILIZADO[unidade]}<extra></extra>",
         ), row=1, col=2)
 
@@ -297,26 +291,25 @@ def main():
     sx, sy = inicial["sill"]
     fig.add_trace(go.Scatter(
         x=sx, y=sy, fill="toself", fillcolor=CORES_ESTILIZADO["Gp_SerraGeral"], line=dict(width=0.5, color=MARCA_NAVY), mode="lines",
-        name="Sill (Gp. Serra Geral)", showlegend=True,
-        hovertemplate="Sill<extra></extra>",
+        name="Sill (Gp. Serra Geral)", showlegend=False, hovertemplate="Sill<extra></extra>",
     ), row=1, col=2)
 
     idx_terreno_perfil = len(fig.data)
     fig.add_trace(go.Scatter(x=inicial["terreno"][0], y=inicial["terreno"][1], mode="lines",
-                              line=dict(color="#E8A33D", width=2), name="Terreno real", showlegend=True), row=1, col=2)
+                              line=dict(color="#E8A33D", width=2), name="Terreno real", showlegend=False,
+                              hovertemplate="Terreno real<extra></extra>"), row=1, col=2)
 
-    # furos no perfil: contorno preto (1 legenda) + 1 traço colorido por classe (unidade / sem topos / corpo intrusivo)
+    # furos no perfil: contorno preto + 1 traço colorido por classe (unidade / sem topos / corpo intrusivo)
     fb = inicial["furos"]["base"]
     idx_furos_base = len(fig.data)
-    fig.add_trace(go.Scatter(x=fb[0], y=fb[1], mode="lines", line=dict(color="black", width=9), name=f"Furos (±{BUFFER_FUROS_M / 1000:.1f} km)",
-                              legendgroup="furos", showlegend=True, hoverinfo="skip"), row=1, col=2)
+    fig.add_trace(go.Scatter(x=fb[0], y=fb[1], mode="lines", line=dict(color="black", width=9), name="Furos",
+                              showlegend=False, hoverinfo="skip"), row=1, col=2)
     idx_furos_cls = []
     for k, (nome_k, cor_k) in enumerate(zip(NOMES_CLASSES_FURO, CORES_CLASSES_FURO)):
         cx_, cy_, ct_ = inicial["furos"]["cls"][k]
         idx_furos_cls.append(len(fig.data))
         fig.add_trace(go.Scatter(x=cx_, y=cy_, text=ct_, mode="lines", line=dict(color=cor_k, width=5 if k < len(NOMES_CLASSES_FURO) - 1 else 7),
-                                  name=f"Furo · {nome_k}", legendgroup="furos", showlegend=False,
-                                  hovertemplate="%{text}<extra></extra>"), row=1, col=2)
+                                  name=f"Furo · {nome_k}", showlegend=False, hovertemplate="%{text}<extra></extra>"), row=1, col=2)
 
     idx_traces_frame = ([idx_linha_mapa] + [idx_bandas[u] for u in UNIDADES_ESTILIZADO]
                         + [idx_sill, idx_terreno_perfil, idx_furos_base] + idx_furos_cls)
@@ -349,150 +342,137 @@ def main():
             frames.append(go.Frame(data=dados_frame, name=f"{a}_{p}", traces=idx_traces_frame))
     fig.frames = frames
 
-    idx_barra = len(fig.data)
-    fig.add_trace(go.Bar(
-        x=[NOMES_ESTILIZADO[u] for u in UNIDADES_ESTILIZADO], y=inicial["espessuras"],
-        marker_color=[CORES_ESTILIZADO[u] for u in UNIDADES_ESTILIZADO], marker_line=dict(color=MARCA_ROXO, width=1),
-        text=[f"{e:.0f}m" for e in inicial["espessuras"]], textposition="outside",
-        showlegend=False, hoverinfo="none",
-    ), row=2, col=1)
-    fig.update_yaxes(title_text="Espessura (m)", row=2, col=1)
-
-    # --- menus: ângulo (skip -- tratado em JS), modo do mapa (update: visibilidade + fundo satélite), furos, tema
-    idx_mapa_cor = [0] + list(range(idx_geo_inicio, idx_geo_fim + 1))
-    botoes_angulo = [dict(label=nome, method="skip") for nome, _ in ANGULOS]
-    botoes_mapa_cor = [
-        dict(label="Mapa: Hipsometria", method="update",
-             args=[{"visible": [True] + [False] * n_geo, "opacity": [1] + [1] * n_geo}, {"images[0].visible": False}, idx_mapa_cor]),
-        dict(label="Mapa: Geologia (CPRM + sills)", method="update",
-             args=[{"visible": [True] + [True] * n_geo, "opacity": [0] + [1] * n_geo}, {"images[0].visible": False}, idx_mapa_cor]),
-        dict(label="Mapa: Satélite", method="update",
-             args=[{"visible": [True] + [False] * n_geo, "opacity": [0] + [1] * n_geo}, {"images[0].visible": True}, idx_mapa_cor]),
-    ]   # o heatmap fica sempre visível (opacidade 0 nos outros modos) -- é ele que recebe o clique que move a linha de corte
-    idx_furos_todos = [idx_furos_mapa, idx_furos_base] + idx_furos_cls
-    botoes_furos = [
-        dict(label="Furos: ON", method="restyle", args=[{"visible": True}, idx_furos_todos]),
-        dict(label="Furos: OFF", method="restyle", args=[{"visible": False}, idx_furos_todos]),
-    ]
-
+    # --- tudo que é controle fica FORA do plot (barra HTML no topo); o plot só tem mapa + perfil
     tema = tema_escuro()
-    estilo_menu = dict(direction="down", xanchor="left", y=1.34, yanchor="top", bgcolor="#4A4A4A", font=dict(color="white"))
     fig.update_layout(
         paper_bgcolor=tema["paper_bgcolor"], plot_bgcolor=tema["plot_bgcolor"],
-        font=dict(family=MARCA_FONTE, color=tema["font_color"]),
-        legend=dict(x=1.01, y=0.9, bgcolor="rgba(0,0,0,0)"),
-        margin=dict(l=60, r=170, t=175, b=60),
-        updatemenus=[
-            dict(buttons=botoes_angulo, x=0.0, **estilo_menu),
-            dict(buttons=botoes_mapa_cor, x=0.16, **estilo_menu),
-            dict(buttons=botoes_furos, x=0.40, **estilo_menu),
-            dict(buttons=botoes_tema(eixos_2d=["xaxis", "yaxis", "xaxis2", "yaxis2", "xaxis3", "yaxis3"]), x=0.50, active=1, **estilo_menu),
-        ],
-        sliders=[dict(
-            active=p0, x=0.0, len=0.66, xanchor="left", y=1.19, yanchor="top",
-            currentvalue=dict(prefix="Posição do corte: ", font=dict(size=12, color=tema["font_color"])),
-            font=dict(size=1, color="rgba(0,0,0,0)"),   # esconde os rótulos das 23 posições (só o valor atual aparece)
-            steps=[
-                dict(method="animate", args=[[f"0_{p}"], dict(mode="immediate", frame=dict(duration=0, redraw=True), transition=dict(duration=0))],
-                     label=f"{angulos_info[0]['t_vals'][p]:+.0f} m")
-                for p in range(n_pos_inicial)
-            ],
-        )],
+        font=dict(family=MARCA_FONTE, color=tema["font_color"]), showlegend=False,
+        margin=dict(l=62, r=14, t=10, b=48),
         images=[dict(source=sat_uri, xref="x", yref="y", x=e_min, y=n_max, sizex=e_max - e_min, sizey=n_max - n_min,
                      xanchor="left", yanchor="top", sizing="stretch", layer="below", opacity=1, visible=False)],
     )
-    for eixo in ("xaxis", "yaxis", "xaxis2", "yaxis2", "xaxis3", "yaxis3"):
+    for eixo in ("xaxis", "yaxis", "xaxis2", "yaxis2"):
         fig.layout[eixo].update(color=tema["axis_color"], gridcolor=tema["grid_color"])
 
-    angulos_js = ",\n        ".join(
-        "{dx:%.6f, dy:%.6f, px:%.6f, py:%.6f, s0:%.3f, compKm:%.3f, t:[%s]}" % (
-            info["dx"], info["dy"], info["px"], info["py"], info["s_vals"][0],
-            (info["s_vals"][-1] - info["s_vals"][0]) / 1000,
-            ",".join(f"{t:.2f}" for t in info["t_vals"]),
-        )
-        for info in angulos_info
+    idx_mapa_cor = [0] + list(range(idx_geo_inicio, idx_geo_fim + 1))
+    # o heatmap fica sempre visível (opacidade 0 nos outros modos) -- é ele que recebe o clique que move a linha de corte
+    modos_mapa = [
+        dict(nome="Hipsometria", visible=[True] + [False] * n_geo, opacity=[1] + [1] * n_geo, img=False),
+        dict(nome="Geologia (CPRM + sills)", visible=[True] + [True] * n_geo, opacity=[0] + [1] * n_geo, img=False),
+        dict(nome="Satélite", visible=[True] + [False] * n_geo, opacity=[0] + [1] * n_geo, img=True),
+    ]
+    legenda = (
+        [dict(nome=NOMES_ESTILIZADO[u], cor=CORES_ESTILIZADO[u], idx=[idx_bandas[u]]) for u in UNIDADES_ESTILIZADO]
+        + [dict(nome="Sill (Gp. Serra Geral)", cor=CORES_ESTILIZADO["Gp_SerraGeral"], idx=[idx_sill]),
+           dict(nome="Terreno real", cor="#E8A33D", idx=[idx_terreno_perfil])]
+    )
+    furos_legenda = [dict(nome=n, cor=c) for n, c in zip(NOMES_CLASSES_FURO, CORES_CLASSES_FURO)]
+    cfg = dict(
+        cx=cx, cy=cy, p0=p0, idxMapaMax=idx_geo_fim, idxMapaCor=idx_mapa_cor, modos=modos_mapa,
+        idxFuros=[idx_furos_mapa, idx_furos_base] + idx_furos_cls,
+        angulos=[dict(nome=info["nome"], px=info["px"], py=info["py"], compKm=(info["s_vals"][-1] - info["s_vals"][0]) / 1000,
+                      t=[round(float(t), 2) for t in info["t_vals"]]) for info in angulos_info],
+        temas=dict(escuro=dict(paper=tema_escuro()["paper_bgcolor"], plot=tema_escuro()["plot_bgcolor"], font=tema_escuro()["font_color"],
+                               grid=tema_escuro()["grid_color"], axis=tema_escuro()["axis_color"]),
+                   claro=dict(paper=tema_claro()["paper_bgcolor"], plot=tema_claro()["plot_bgcolor"], font=tema_claro()["font_color"],
+                              grid=tema_claro()["grid_color"], axis=tema_claro()["axis_color"])),
+        legenda=legenda,
     )
 
-    def fmt(e):
-        return "NaN" if np.isnan(e) else f"{e:.1f}"
+    def opcoes(itens):
+        return "".join(f'<option value="{i}">{n}</option>' for i, n in enumerate(itens))
 
-    espessuras_js = ",\n        ".join(
-        "[" + ",\n         ".join("[" + ",".join(fmt(e) for e in secao["espessuras"]) + "]" for secao in secoes_angulo) + "]"
-        for secoes_angulo in todas_secoes
-    )
-
-    post_script = f"""
-    (function() {{
-        var CX = {cx}, CY = {cy};
-        var ANGULOS = [{angulos_js}];
-        var ESPESSURAS = [{espessuras_js}];
-        var IDX_BARRA = {idx_barra};
-        var IDX_MAPA_MIN = 0, IDX_MAPA_MAX = {idx_geo_fim};
-        var anguloAtual = 0;
-        var gd = document.getElementsByClassName('plotly-graph-div')[0];
-
-        function atualizarBarra(a, p) {{
-            var vals = ESPESSURAS[a][p];
-            var rotulos = vals.map(function(v) {{ return Math.round(v) + 'm'; }});
-            Plotly.restyle(gd, {{y: [vals], text: [rotulos]}}, [IDX_BARRA]);
-        }}
-        function stepsParaAngulo(a) {{
-            var info = ANGULOS[a];
-            var steps = [];
-            for (var p = 0; p < info.t.length; p++) {{
-                var rotulo = (info.t[p] >= 0 ? '+' : '') + info.t[p].toFixed(0) + ' m';
-                steps.push({{method: 'animate', args: [[a + '_' + p], {{mode: 'immediate', frame: {{duration: 0, redraw: true}}, transition: {{duration: 0}}}}], label: rotulo}});
-            }}
-            return steps;
-        }}
-        function irParaAngulo(a) {{
-            anguloAtual = a;
-            var posMeio = Math.floor(ANGULOS[a].t.length / 2);
-            Plotly.relayout(gd, {{'sliders[0].steps': stepsParaAngulo(a), 'sliders[0].active': posMeio, 'xaxis2.range': [0, ANGULOS[a].compKm]}});
-            Plotly.animate(gd, [a + '_' + posMeio], {{mode: 'immediate', frame: {{duration: 0, redraw: true}}, transition: {{duration: 0}}}}).catch(function() {{}});
-            atualizarBarra(a, posMeio);
-        }}
-        gd.on('plotly_buttonclicked', function(ev) {{
-            if (typeof ev.active !== 'number') return;
-            if (Math.abs(ev.menu.y - 1.34) <= 0.01 && ev.menu.x < 0.1) {{ irParaAngulo(ev.active); }}
-        }});
-        gd.on('plotly_sliderchange', function() {{
-            setTimeout(function() {{ atualizarBarra(anguloAtual, gd.layout.sliders[0].active); }}, 0);
-        }});
-        gd.on('plotly_click', function(data) {{
-            var ponto = data.points[0];
-            if (!(ponto.curveNumber >= IDX_MAPA_MIN && ponto.curveNumber <= IDX_MAPA_MAX)) return;
-            var info = ANGULOS[anguloAtual];
-            var t = (ponto.x - CX) * info.px + (ponto.y - CY) * info.py;
-            var melhorIdx = 0, melhorDist = Infinity;
-            for (var p = 0; p < info.t.length; p++) {{
-                var d = Math.abs(info.t[p] - t);
-                if (d < melhorDist) {{ melhorDist = d; melhorIdx = p; }}
-            }}
-            Plotly.relayout(gd, {{'sliders[0].active': melhorIdx}});
-            Plotly.animate(gd, [anguloAtual + '_' + melhorIdx], {{mode: 'immediate', frame: {{duration: 0, redraw: true}}, transition: {{duration: 0}}}}).catch(function() {{}});
-            atualizarBarra(anguloAtual, melhorIdx);
-        }});
-        // abre com o slider na posição central (o Plotly ignora sliders.active no carregamento com frames)
-        Plotly.relayout(gd, {{'sliders[0].active': {p0}}});
-        atualizarBarra(0, {p0});
-    }})();
-    """
+    html_legenda = "".join(
+        f'<span class="leg-item" data-i="{i}"><i style="background:{it["cor"]}"></i>{it["nome"]}</span>' for i, it in enumerate(legenda))
+    html_furos_leg = "".join(f'<span class="leg-fixo"><i style="background:{it["cor"]}"></i>{it["nome"]}</span>' for it in furos_legenda)
 
     logo = logo_base64()
-    grafico = pio.to_html(fig, full_html=False, include_plotlyjs=False, post_script=post_script, div_id="secao",
-                          config={"responsive": True, "displaylogo": False})
+    grafico = pio.to_html(fig, full_html=False, include_plotlyjs=False, post_script=POST_JS.replace("@@CFG@@", json.dumps(cfg, ensure_ascii=False)),
+                          div_id="secao", auto_play=False, config={"responsive": True, "displaylogo": False})   # auto_play=False: senão o Plotly sai tocando todos os frames
     html = TEMPLATE
     for token, valor in {
         "@@PLOTLY@@": PLOTLY_CDN, "@@FONTE@@": MARCA_FONTE, "@@NAVY@@": MARCA_NAVY, "@@ROXO@@": MARCA_ROXO,
         "@@CINZA@@": MARCA_CINZA_CLARO,
         "@@LOGO@@": f'<img src="data:image/jpeg;base64,{logo}" alt="GS Tech">' if logo else "",
+        "@@OPC_ANGULO@@": opcoes([a["nome"] for a in cfg["angulos"]]),
+        "@@OPC_MAPA@@": opcoes([m["nome"] for m in modos_mapa]),
+        "@@NPOS@@": str(len(angulos_info[0]["t_vals"]) - 1), "@@P0@@": str(p0),
+        "@@LEGENDA@@": html_legenda, "@@FUROS_LEG@@": html_furos_leg,
         "@@GRAFICO@@": grafico,
     }.items():
         html = html.replace(token, valor)
+    assert "@@" not in html.replace("@@CFG@@", ""), "token sem substituir"
     OUT_HTML.write_text(html, encoding="utf-8")
     print(f"[info] {len(angulos_info)} ângulos, {n_pos_inicial} posições iniciais, {len(sills)} sills, {len(frames)} frames")
     print(f"-> {OUT_HTML} ({OUT_HTML.stat().st_size / 1024:.0f} KB)")
+
+
+POST_JS = r"""
+(function() {
+    var C = @@CFG@@;
+    var gd = document.getElementById('secao');
+    var anguloAtual = 0, posAtual = C.p0, furosOn = true;
+    var sl = document.getElementById('corte-pos'), lab = document.getElementById('corte-val');
+    var OPT = {mode: 'immediate', frame: {duration: 0, redraw: true}, transition: {duration: 0}};
+
+    function rotulo(a, p) { var v = C.angulos[a].t[p]; return (v >= 0 ? '+' : '') + v.toFixed(0) + ' m'; }
+    function irPara(a, p) {
+        anguloAtual = a; posAtual = p; sl.value = p; lab.textContent = rotulo(a, p);
+        Plotly.animate(gd, [a + '_' + p], OPT).catch(function() {});
+    }
+    document.getElementById('sel-angulo').addEventListener('change', function(ev) {
+        var a = +ev.target.value, n = C.angulos[a].t.length;
+        sl.max = n - 1;
+        Plotly.relayout(gd, {'xaxis2.range': [0, C.angulos[a].compKm]});
+        irPara(a, Math.floor(n / 2));
+    });
+    sl.addEventListener('input', function() { irPara(anguloAtual, +sl.value); });
+
+    // clique no mapa move a linha de corte
+    gd.on('plotly_click', function(data) {
+        var pt = data.points[0];
+        if (!(pt.curveNumber >= 0 && pt.curveNumber <= C.idxMapaMax)) return;
+        var info = C.angulos[anguloAtual];
+        var t = (pt.x - C.cx) * info.px + (pt.y - C.cy) * info.py, melhor = 0, dmin = Infinity;
+        for (var p = 0; p < info.t.length; p++) { var d = Math.abs(info.t[p] - t); if (d < dmin) { dmin = d; melhor = p; } }
+        irPara(anguloAtual, melhor);
+    });
+
+    // modo do mapa
+    document.getElementById('sel-mapa').addEventListener('change', function(ev) {
+        var m = C.modos[+ev.target.value];
+        Plotly.update(gd, {visible: m.visible, opacity: m.opacity}, {'images[0].visible': m.img}, C.idxMapaCor);
+    });
+
+    // furos ON/OFF
+    var bF = document.getElementById('b-furos');
+    bF.addEventListener('click', function() {
+        furosOn = !furosOn; bF.classList.toggle('ativo', furosOn); bF.textContent = 'Furos: ' + (furosOn ? 'ON' : 'OFF');
+        Plotly.restyle(gd, {visible: furosOn}, C.idxFuros);
+    });
+
+    // legenda clicável (liga/desliga cada camada do perfil)
+    document.querySelectorAll('.leg-item').forEach(function(el) {
+        el.addEventListener('click', function() {
+            var it = C.legenda[+el.getAttribute('data-i')], off = el.classList.toggle('off');
+            Plotly.restyle(gd, {visible: off ? 'legendonly' : true}, it.idx);
+        });
+    });
+
+    // tema: página + gráfico
+    function aplicarTema(nome) {
+        var t = C.temas[nome];
+        document.body.classList.toggle('tema-claro', nome === 'claro');
+        document.querySelectorAll('[data-tema]').forEach(function(b) { b.classList.toggle('ativo', b.getAttribute('data-tema') === nome); });
+        var up = {paper_bgcolor: t.paper, plot_bgcolor: t.plot, 'font.color': t.font};
+        ['xaxis', 'yaxis', 'xaxis2', 'yaxis2'].forEach(function(ax) { up[ax + '.color'] = t.axis; up[ax + '.gridcolor'] = t.grid; });
+        Plotly.relayout(gd, up);
+    }
+    document.querySelectorAll('[data-tema]').forEach(function(b) { b.addEventListener('click', function() { aplicarTema(b.getAttribute('data-tema')); }); });
+
+    lab.textContent = rotulo(0, C.p0);
+})();
+"""
 
 
 TEMPLATE = r"""<!DOCTYPE html>
@@ -507,16 +487,33 @@ TEMPLATE = r"""<!DOCTYPE html>
 <script src="@@PLOTLY@@"></script>
 <style>
   * { box-sizing: border-box; }
+  :root { --bg: @@NAVY@@; --painel: #262B3D; --texto: @@CINZA@@; --borda: #3a3f52; }
+  body.tema-claro { --bg: #FFFFFF; --painel: #F2F2F7; --texto: @@NAVY@@; --borda: #D8D8E2; }
   html, body { height: 100%; }
-  body { margin: 0; background: @@NAVY@@; color: @@CINZA@@; font-family: @@FONTE@@; display: flex; flex-direction: column; transition: background .2s; }
-  body.tema-claro { background: #FFFFFF; color: @@NAVY@@; }
-  header { display: flex; align-items: center; justify-content: space-between; padding: 10px 24px; border-bottom: 1px solid @@ROXO@@; gap: 16px; flex-shrink: 0; }
-  header h1 { font-size: 19px; margin: 0; }
+  body { margin: 0; background: var(--bg); color: var(--texto); font-family: @@FONTE@@; display: flex; flex-direction: column; transition: background .2s, color .2s; }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 6px 20px; border-bottom: 1px solid @@ROXO@@; gap: 16px; flex-shrink: 0; }
+  header h1 { font-size: 17px; margin: 0; }
   header h1 b { color: @@ROXO@@; }
-  header img { width: 46px; height: 46px; border-radius: 50%; border: 2px solid @@ROXO@@; box-shadow: 0 0 10px rgba(123,47,255,.6); }
-  #wrap { flex: 1; min-height: 0; }
+  header img { width: 38px; height: 38px; border-radius: 50%; border: 2px solid @@ROXO@@; box-shadow: 0 0 10px rgba(123,47,255,.6); }
+  #barra { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 22px; padding: 10px 20px; background: var(--painel); border-bottom: 1px solid var(--borda); font-size: 12px; flex-shrink: 0; }
+  .grupo { display: flex; align-items: center; gap: 7px; }
+  .grupo > .rot { opacity: .65; text-transform: uppercase; letter-spacing: .04em; font-size: 10.5px; }
+  select, .btn { font-family: @@FONTE@@; font-size: 12px; background: transparent; color: var(--texto); border: 1px solid @@ROXO@@; border-radius: 6px; padding: 5px 9px; }
+  select { background: var(--bg); padding: 4px 6px; }
+  .btn { cursor: pointer; opacity: .65; }
+  .btn:hover { opacity: 1; }
+  .btn.ativo { opacity: 1; background: @@ROXO@@; color: #fff; }
+  input[type=range] { accent-color: @@ROXO@@; width: 280px; }
+  #corte-val { min-width: 62px; font-variant-numeric: tabular-nums; font-weight: 600; }
+  #legenda { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; padding: 8px 20px 10px; font-size: 11.5px; flex-shrink: 0; border-bottom: 1px solid var(--borda); }
+  .leg-item, .leg-fixo { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .leg-item { cursor: pointer; }
+  .leg-item.off { opacity: .35; text-decoration: line-through; }
+  #legenda i { width: 14px; height: 10px; border-radius: 2px; display: inline-block; border: 1px solid rgba(255,255,255,.35); }
+  .leg-sep { opacity: .5; font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; margin-left: 10px; }
+  #wrap { flex: 1; min-height: 0; padding: 14px 8px 0 8px; }
   #wrap .plotly-graph-div, #wrap > div { height: 100% !important; }
-  footer { text-align: center; padding: 4px; opacity: .5; font-size: 11px; flex-shrink: 0; }
+  footer { text-align: center; padding: 3px; opacity: .5; font-size: 10.5px; flex-shrink: 0; }
 </style>
 </head>
 <body>
@@ -524,17 +521,16 @@ TEMPLATE = r"""<!DOCTYPE html>
   <h1><b>Seção 2D interativa</b> — PMP · Criciúma</h1>
   @@LOGO@@
 </header>
+<div id="barra">
+  <div class="grupo"><span class="rot">Linha de corte</span><select id="sel-angulo">@@OPC_ANGULO@@</select></div>
+  <div class="grupo"><span class="rot">Mapa</span><select id="sel-mapa">@@OPC_MAPA@@</select></div>
+  <div class="grupo"><span class="rot">Furos</span><button class="btn ativo" id="b-furos">Furos: ON</button></div>
+  <div class="grupo"><span class="rot">Posição do corte</span><input type="range" id="corte-pos" min="0" max="@@NPOS@@" step="1" value="@@P0@@"><span id="corte-val"></span><span style="opacity:.55">ou clique no mapa</span></div>
+  <div class="grupo"><span class="rot">Tema</span><button class="btn ativo" data-tema="escuro">Escuro</button><button class="btn" data-tema="claro">Claro</button></div>
+</div>
+<div id="legenda">@@LEGENDA@@<span class="leg-sep">Furos:</span>@@FUROS_LEG@@</div>
 <div id="wrap">@@GRAFICO@@</div>
 <footer>GS Tech · PMP</footer>
-<script>
-  (function() {
-    var gd = document.getElementById('secao');
-    // o dropdown de tema do Plotly só recolore o gráfico; aqui a página inteira acompanha
-    gd.on('plotly_relayout', function(ev) {
-      if (ev && ev['paper_bgcolor'] !== undefined) document.body.classList.toggle('tema-claro', ev['paper_bgcolor'] === '#FFFFFF');
-    });
-  })();
-</script>
 </body>
 </html>
 """
