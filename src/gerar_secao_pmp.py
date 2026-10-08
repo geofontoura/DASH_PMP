@@ -53,6 +53,7 @@ N_AMOSTRAS_LINHA = 150
 RESOLUCAO_MAPA = 140
 RAIO_MASCARA_KM = 3.0
 N_AMOSTRAS_SECAO_FIXA = 260   # pontos ao longo de cada linha A-D (polilinha)
+LARGURA_SUB_KM = 0.25     # sill visto só em furo: extensão lateral desenhada de cada lado do furo (ilustrativa)
 BUFFER_FUROS_M = 1_500.0   # furos até essa distância da linha de corte aparecem no perfil
 PLOTLY_CDN = f"https://cdn.plot.ly/plotly-{__import__('plotly').offline.get_plotlyjs_version()}.min.js"
 NOMES_CLASSES_FURO = [n for _, n, _ in ORDEM_PROFUNDIDADE_FURO] + ["sem topos medidos", "corpo intrusivo"]
@@ -155,6 +156,7 @@ def furos_no_perfil(F, dx, dy, px, py, t, cx, cy, s0, terr=None):
     n_cls = len(NOMES_CLASSES_FURO)
     cls = [([], [], []) for _ in range(n_cls)]
     lab = ([], [], [])   # rótulo (código do furo) na base de cada coluna
+    sub = ([], [], [])   # sills só vistos em furo, estendidos LARGURA_SUB_KM pra cada lado
     perp = (F["x"] - cx) * px + (F["y"] - cy) * py - t
     for i in np.where(np.abs(perp) <= BUFFER_FUROS_M)[0]:
         d = round(float(((F["x"][i] - cx - t * px) * dx + (F["y"][i] - cy - t * py) * dy - s0) / 1000), 3)
@@ -167,11 +169,16 @@ def furos_no_perfil(F, dx, dy, px, py, t, cx, cy, s0, terr=None):
             k = n_cls - 1
             cls[k][0].extend([d, d, None]); cls[k][1].extend([round(min(z0 - a, zt), 1), round(min(z0 - b, zt), 1), None])
             cls[k][2].extend([f"<b>{nome}</b><br>corpo intrusivo: {a:.1f}–{b:.1f} m ({b - a:.1f} m)", None, None])
+        for a, b in F["corpos"][i]:
+            ta, tb = round(min(z0 - a, zt), 1), round(min(z0 - b, zt), 1)
+            sub[0].extend([d - LARGURA_SUB_KM, d + LARGURA_SUB_KM, d + LARGURA_SUB_KM, d - LARGURA_SUB_KM, d - LARGURA_SUB_KM, None])
+            sub[1].extend([ta, ta, tb, tb, ta, None])
+            sub[2].extend([f"<b>{nome}</b><br>sill em subsuperfície: {a:.1f}–{b:.1f} m de prof. ({b - a:.1f} m)<br>extensão lateral ±{LARGURA_SUB_KM * 1000:.0f} m ilustrativa"] * 5 + [None])
         fundo = max([f for _, f, _ in F["segs"][i]] + [b for _, b in F["corpos"][i]], default=None)
         if fundo is not None:
             lab[0].append(d); lab[1].append(round(min(z0 - fundo, zt), 1)); lab[2].append(nome)
     base = ([v for c in cls for v in c[0]], [v for c in cls for v in c[1]], [None] * sum(len(c[0]) for c in cls))
-    return dict(base=base, cls=cls, lab=lab)
+    return dict(base=base, cls=cls, lab=lab, sub=sub)
 
 
 def furos_na_polilinha(F, linha, terr=None):
@@ -181,6 +188,7 @@ def furos_na_polilinha(F, linha, terr=None):
     n_cls = len(NOMES_CLASSES_FURO)
     cls = [([], [], []) for _ in range(n_cls)]
     lab = ([], [], [])   # rótulo (código do furo) na base de cada coluna
+    sub = ([], [], [])   # sills só vistos em furo, estendidos LARGURA_SUB_KM pra cada lado
     for i in range(len(F["x"])):
         pt = shapely.Point(F["x"][i], F["y"][i])
         if linha.distance(pt) > BUFFER_FUROS_M:
@@ -195,11 +203,16 @@ def furos_na_polilinha(F, linha, terr=None):
             k = n_cls - 1
             cls[k][0].extend([d, d, None]); cls[k][1].extend([round(min(z0 - a, zt), 1), round(min(z0 - b, zt), 1), None])
             cls[k][2].extend([f"<b>{nome}</b><br>corpo intrusivo: {a:.1f}–{b:.1f} m ({b - a:.1f} m)", None, None])
+        for a, b in F["corpos"][i]:
+            ta, tb = round(min(z0 - a, zt), 1), round(min(z0 - b, zt), 1)
+            sub[0].extend([d - LARGURA_SUB_KM, d + LARGURA_SUB_KM, d + LARGURA_SUB_KM, d - LARGURA_SUB_KM, d - LARGURA_SUB_KM, None])
+            sub[1].extend([ta, ta, tb, tb, ta, None])
+            sub[2].extend([f"<b>{nome}</b><br>sill em subsuperfície: {a:.1f}–{b:.1f} m de prof. ({b - a:.1f} m)<br>extensão lateral ±{LARGURA_SUB_KM * 1000:.0f} m ilustrativa"] * 5 + [None])
         fundo = max([f for _, f, _ in F["segs"][i]] + [b for _, b in F["corpos"][i]], default=None)
         if fundo is not None:
             lab[0].append(d); lab[1].append(round(min(z0 - fundo, zt), 1)); lab[2].append(nome)
     base = ([v for c in cls for v in c[0]], [v for c in cls for v in c[1]], [None] * sum(len(c[0]) for c in cls))
-    return dict(base=base, cls=cls, lab=lab)
+    return dict(base=base, cls=cls, lab=lab, sub=sub)
 
 
 def secao_na_polilinha(linha, interp_terreno, planos, sills, furos):
@@ -401,6 +414,11 @@ def main():
 
     # furos no perfil: contorno preto + 1 traço colorido por classe (unidade / sem topos / corpo intrusivo)
     fb = inicial["furos"]["base"]
+    sb = inicial["furos"]["sub"]
+    idx_sub = len(fig.data)
+    fig.add_trace(go.Scatter(x=sb[0], y=sb[1], text=sb[2], mode="lines", fill="toself", fillcolor="rgba(230,57,70,0.55)",
+                              line=dict(color="#E63946", width=1), name="Sill em subsuperfície (furos)", showlegend=False,
+                              hoveron="fills", hovertemplate="%{text}<extra></extra>"), row=1, col=2)
     idx_furos_base = len(fig.data)
     fig.add_trace(go.Scatter(x=fb[0], y=fb[1], mode="lines", line=dict(color="black", width=9), name="Furos",
                               showlegend=False, hoverinfo="skip"), row=1, col=2)
@@ -418,13 +436,13 @@ def main():
                               textfont=dict(size=9, color=MARCA_NAVY, family=MARCA_FONTE), name="Códigos dos furos",
                               showlegend=False, hoverinfo="skip", cliponaxis=True), row=1, col=2)
     idx_traces_frame = ([idx_linha_mapa] + [idx_bandas[u] for u in UNIDADES_ESTILIZADO]
-                        + [idx_sill, idx_terreno_perfil, idx_furos_base] + idx_furos_cls + [idx_furos_rot])
+                        + [idx_sill, idx_terreno_perfil, idx_sub, idx_furos_base] + idx_furos_cls + [idx_furos_rot])
 
     comprimento0_km = (angulos_info[0]["s_vals"][-1] - angulos_info[0]["s_vals"][0]) / 1000
     fig.update_xaxes(title_text="Distância ao longo da seção (km)", row=1, col=2, range=[0, comprimento0_km], autorange=False)
     fig.update_yaxes(title_text="Altitude (m)", row=1, col=2)
 
-    ordem_frame = (["linha_mapa"] + UNIDADES_ESTILIZADO + ["sill", "terreno", "furos_base"]
+    ordem_frame = (["linha_mapa"] + UNIDADES_ESTILIZADO + ["sill", "terreno", "sub", "furos_base"]
                    + [f"furos_{k}" for k in range(len(NOMES_CLASSES_FURO))] + ["rotulos"])
     def montar_dados_frame(secao):
         dados = []
@@ -438,6 +456,9 @@ def main():
                 x, y = secao["sill"]
             elif chave == "furos_base":
                 x, y, _ = secao["furos"]["base"]
+            elif chave == "sub":
+                x, y, text = secao["furos"]["sub"]
+                dados.append(go.Scatter(x=x, y=y, text=text)); continue
             elif chave == "rotulos":
                 x, y, text = secao["furos"]["lab"]
                 dados.append(go.Scatter(x=x, y=y, text=text)); continue
@@ -484,6 +505,7 @@ def main():
     legenda = (
         [dict(nome=NOMES_ESTILIZADO[u], cor=CORES_ESTILIZADO[u], idx=[idx_bandas[u]]) for u in UNIDADES_ESTILIZADO]
         + [dict(nome="Sill (Gp. Serra Geral)", cor=CORES_ESTILIZADO["Gp_SerraGeral"], idx=[idx_sill]),
+           dict(nome="Sill visto só em furo (±%d m)" % round(LARGURA_SUB_KM * 1000), cor="#E63946", idx=[idx_sub]),
            dict(nome="Terreno real", cor="#E8A33D", idx=[idx_terreno_perfil])]
     )
     furos_legenda = [dict(nome=n, cor=c) for n, c in zip(NOMES_CLASSES_FURO, CORES_CLASSES_FURO)]

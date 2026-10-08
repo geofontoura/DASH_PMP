@@ -53,6 +53,7 @@ N = 130                 # grade do terreno/contatos (nós por eixo)
 PASSO_SILL_M = 100.0    # espaçamento da grade de cada sill (m)
 MAX_NOS_SILL = 110
 OFFSET_TERRENO_M = 2.0  # terreno "flutua" 2 m sobre o topo das formações expostas (evita z-fighting)
+RAIO_SUB_M = 250.0       # sill visto só em furo: raio do cilindro desenhado em volta do furo (ilustrativo)
 OFFSET_SILL_M = 4.0     # sill sobe 4 m sobre o terreno (aparece como corpo, não como manchinha)
 
 
@@ -160,7 +161,7 @@ def montar_dados():
         camadas=camadas, sills=sills, furos=furos,
         unidades_furo=[dict(n=n_, c=c_) for _, n_, c_ in ORDEM_PROFUNDIDADE_FURO],
         cor_sill=CORES_ESTILIZADO["Gp_SerraGeral"], esp_sill=ESPESSURA_SILL_M,
-        offsets=dict(terreno=OFFSET_TERRENO_M),
+        offsets=dict(terreno=OFFSET_TERRENO_M), raio_sub=RAIO_SUB_M,
     )
 
 
@@ -338,7 +339,8 @@ TEMPLATE = r"""<!DOCTYPE html>
     };
     var gd = document.getElementById('cubo');
     var IDX = { terreno: 0, camadas: 1, sills: 1 + CAMADAS.length, furos: 1 + CAMADAS.length + SILLS.length };
-    var N_FUROS_TR = UNID.length + 2;   // 1 por unidade + "sem topos" + "corpo intrusivo"
+    var N_FUROS_TR = UNID.length + 2;
+    var IDX_SUB = 1 + CAMADAS.length + SILLS.length + N_FUROS_TR + 1;   // por último: não desloca os outros índices   // 1 por unidade + "sem topos" + "corpo intrusivo"
 
     function traceMalha(nome, cor, extra) {
         var t = { type: 'mesh3d', x: [], y: [], z: [], i: [], j: [], k: [], color: cor, name: nome, showlegend: true,
@@ -361,6 +363,7 @@ TEMPLATE = r"""<!DOCTYPE html>
                   legendgroup: 'furos', showlegend: false, hoverinfo: 'skip' });
         tr.push({ type: 'scatter3d', mode: 'markers', x: [], y: [], z: [], text: [], hoverinfo: 'text', name: 'Furos de sondagem',
                   legendgroup: 'furos', showlegend: true, marker: { size: 3.5, color: '#FFFFFF', line: { color: '@@NAVY@@', width: 1 } } });
+        tr.push(traceMalha('Sills vistos só em furo (±' + Math.round(D.raio_sub) + ' m)', '#E63946', { opacity: 0.9 }));
         return tr;
     }
     function fmt0(v) { return Math.round(v).toString(); }
@@ -424,6 +427,30 @@ TEMPLATE = r"""<!DOCTYPE html>
         for (var u = 0; u < N_FUROS_TR; u++) { fx.push(fu.seg[u].x); fy.push(fu.seg[u].y); fz.push(fu.seg[u].z); fidx.push(IDX.furos + u); }
         Plotly.restyle(gd, { x: fx, y: fy, z: fz }, fidx);
         Plotly.restyle(gd, { x: [fu.m.x], y: [fu.m.y], z: [fu.m.z], text: [fu.m.t] }, [IDX.furos + N_FUROS_TR]);
+        var ps = prismasSub(spec);
+        Plotly.restyle(gd, { x: [ps.x], y: [ps.y], z: [ps.z], i: [ps.i], j: [ps.j], k: [ps.k] }, [IDX_SUB]);
+    }
+
+    // sills só interceptados em furo: prisma octogonal (raio D.raio_sub) em volta do furo, no intervalo medido de corpo intrusivo
+    function prismasSub(spec) {
+        var vx = [], vy = [], vz = [], I = [], J = [], K = [], n = 10, R = D.raio_sub;
+        FUROS.forEach(function(w) {
+            if (!mantido(w.x, w.y, spec)) return;
+            w.corpos.forEach(function(cp) {
+                var zt = w.z0 - cp[0], zb = w.z0 - cp[1], b0 = vx.length, k;
+                for (k = 0; k < n; k++) { var a = 2 * Math.PI * k / n; vx.push(w.x + R * Math.cos(a)); vy.push(w.y + R * Math.sin(a)); vz.push(zb); }
+                for (k = 0; k < n; k++) { vx.push(vx[b0 + k]); vy.push(vy[b0 + k]); vz.push(zt); }
+                vx.push(w.x); vy.push(w.y); vz.push(zb); vx.push(w.x); vy.push(w.y); vz.push(zt);
+                var cb = b0 + 2 * n, ct = b0 + 2 * n + 1;
+                for (k = 0; k < n; k++) {
+                    var k2 = (k + 1) % n, a0 = b0 + k, a1 = b0 + k2, t0 = b0 + n + k, t1 = b0 + n + k2;
+                    I.push(a0, a1); J.push(a1, t1); K.push(t0, t0);          // paredes
+                    I.push(cb); J.push(a1); K.push(a0);                      // tampa de baixo
+                    I.push(ct); J.push(t0); K.push(t1);                      // tampa de cima
+                }
+            });
+        });
+        return { x: Float32Array.from(vx), y: Float32Array.from(vy), z: Float32Array.from(vz), i: Int32Array.from(I), j: Int32Array.from(J), k: Int32Array.from(K) };
     }
 
     function visibilidades() {
