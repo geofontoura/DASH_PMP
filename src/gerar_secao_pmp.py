@@ -27,6 +27,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.io as pio
 import shapely
+from shapely.geometry import box
 from PIL import Image
 from plotly.subplots import make_subplots
 
@@ -39,6 +40,7 @@ from _comum_pmp import (
     calcular_planos_estilizados, poligono_para_scatter_xy, pontos_dentro_poligono,
     tema_claro, tema_escuro, adicionar_escala_e_norte, quantizar,
     obter_satelite_utm, preparar_furos, _intervalos_corpo, carregar_linhas_secao,
+    dominio_secoes, carregar_vertices_curvas_ext,
 )
 
 BASE = Path(__file__).resolve().parent
@@ -48,11 +50,11 @@ ANGULOS = [
     ("Leste-Oeste", 0.0), ("Diagonal (SO-NE)", 45.0),
     ("Sul-Norte", 90.0), ("Diagonal (SE-NO)", 135.0),
 ]
-PASSO_POSICAO_M = 1_500.0  # area nova e bem menor (~26x47km) -- passo mais fino que a versao regional
-N_AMOSTRAS_LINHA = 150
+PASSO_POSICAO_M = 3_000.0  # domínio ampliado (~31x58 km): passo maior mantém o HTML num tamanho razoável
+N_AMOSTRAS_LINHA = 240
 RESOLUCAO_MAPA = 140
-RAIO_MASCARA_KM = 3.0
-N_AMOSTRAS_SECAO_FIXA = 260   # pontos ao longo de cada linha A-D (polilinha)
+RAIO_MASCARA_KM = 60.0   # o terreno regional cobre todo o domínio ampliado: sem máscara de distância
+N_AMOSTRAS_SECAO_FIXA = 420   # pontos ao longo de cada linha de seção (polilinha, até ~55 km)
 LARGURA_SUB_KM = 0.25     # sill visto só em furo: extensão lateral desenhada de cada lado do furo (ilustrativa)
 BUFFER_FUROS_M = 1_500.0   # furos até essa distância da linha de corte aparecem no perfil
 PLOTLY_CDN = f"https://cdn.plot.ly/plotly-{__import__('plotly').offline.get_plotlyjs_version()}.min.js"
@@ -97,9 +99,9 @@ def banda_mascarada(dists, topo, base, mask):
     return np.array(xs), np.array(ys)
 
 
-def satelite_jpeg_uri(largura=1100):
+def satelite_jpeg_uri(bounds, largura=1000):
     """Satélite Esri do retângulo como data-URI JPEG (fundo do mapa em modo Satélite)."""
-    raster, _ = obter_satelite_utm()
+    raster, _ = obter_satelite_utm(bounds)
     img = Image.fromarray(np.moveaxis(raster, 0, -1))
     h = int(round(img.height * largura / img.width))
     img = img.resize((largura, h), Image.LANCZOS)
@@ -108,11 +110,11 @@ def satelite_jpeg_uri(largura=1100):
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def preparar_furos_secao(interp_terreno):
+def preparar_furos_secao(interp_terreno, dominio):
     """Furos (só sondagens) prontos pro mapa/perfil: posição, cota do terreno do
     modelo na boca (âncora, pra coluna encostar na linha do terreno), segmentos
     por unidade (ini, fim, classe) e intervalos de corpo intrusivo."""
-    tab = preparar_furos()
+    tab = preparar_furos(dominio=dominio)
     tab = tab[tab["tipo"] == "Furo"].reset_index(drop=True)
     x, y = tab["E"].to_numpy(float), tab["N"].to_numpy(float)
     z0 = avaliar_interpolador(interp_terreno, x, y, raio_mascara_km=60)
@@ -244,21 +246,24 @@ def secao_na_polilinha(linha, interp_terreno, planos, sills, furos):
 
 
 def main():
-    poligono, bounds = carregar_area_pmp()
+    bounds = dominio_secoes()   # area2 + todas as linhas de seção (+ margem)
+    poligono = box(*bounds)
     e_min, n_min, e_max, n_max = bounds
     cx, cy = (e_min + e_max) / 2, (n_min + n_max) / 2
+    print(f"[info] domínio das seções: {(e_max - e_min) / 1000:.1f} x {(n_max - n_min) / 1000:.1f} km")
 
-    xt, yt, zt = carregar_vertices_curvas_pmp()
+    xt, yt, zt = carregar_vertices_curvas_ext(bounds)
     interp_terreno = construir_interpolador(xt, yt, zt)
     litologia = carregar_litologia_pmp()
     planos = calcular_planos_estilizados(litologia, interp_terreno)
     sills = carregar_sills_individualizados()
-    furos = preparar_furos_secao(interp_terreno)
-    sat_uri = satelite_jpeg_uri()
+    furos = preparar_furos_secao(interp_terreno, bounds)
+    sat_uri = satelite_jpeg_uri(bounds)
     print(f"[info] {len(furos['x'])} furos (buffer {BUFFER_FUROS_M:.0f} m no perfil)")
 
     # --- mapa em planta: hipsometria + geologia real ---
-    mx, my = np.meshgrid(np.linspace(e_min, e_max, RESOLUCAO_MAPA), np.linspace(n_min, n_max, RESOLUCAO_MAPA))
+    ny_mapa = int(round(RESOLUCAO_MAPA * (n_max - n_min) / (e_max - e_min)))
+    mx, my = np.meshgrid(np.linspace(e_min, e_max, RESOLUCAO_MAPA), np.linspace(n_min, n_max, ny_mapa))
     dentro_grade = pontos_dentro_poligono(mx, my, poligono)
     mz = avaliar_interpolador(interp_terreno, mx.ravel(), my.ravel(), raio_mascara_km=RAIO_MASCARA_KM).reshape(mx.shape)
     mz = quantizar(np.where(dentro_grade, mz, np.nan), 1)
@@ -494,7 +499,7 @@ def main():
     MODO_INICIAL = 1   # abre com a Geologia (CPRM + sills)
     modos_mapa = [
         dict(nome="Hipsometria", visible=[True] + [False] * n_geo, opacity=[1] + [1] * n_geo, img=False),
-        dict(nome="Geologia (CPRM + sills)", visible=[True] + [True] * n_geo, opacity=[0] + [1] * n_geo, img=False),
+        dict(nome="Geologia (CPRM + sills)", visible=[True] + [True] * n_geo, opacity=[0.4] + [1] * n_geo, img=False),   # hipsometria fraca por baixo: o mapa geológico só cobre a area2
         dict(nome="Satélite", visible=[True] + [False] * n_geo, opacity=[0] + [1] * n_geo, img=True),
     ]
     m0 = modos_mapa[MODO_INICIAL]

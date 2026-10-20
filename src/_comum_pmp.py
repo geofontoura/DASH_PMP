@@ -240,29 +240,110 @@ MAPA_LITOLOGIA_PMP_PARA_UNIDADE = {
 SIGLAS_SILL_INDIVIDUALIZADO = ["K1sg_delta_m", "K1sg_delta_nv", "K1sg_delta_u"]  # "Corpo" na HIERARQUIA -- sills mapeados (Montanhão, Nova Veneza, Urussanga)
 
 
-def carregar_furos_recorte():
-    """Le pontos_unificados_pmp.csv (banco de poços/sondagens regional) e
-    filtra só os que caem DENTRO do retângulo area2.shp -- 304 furos, bem
-    mais denso e mais direto (mede a elevação do topo de verdade, sem
-    depender da suposição "terreno no afloramento = topo da formação") do
-    que os poucos polígonos de afloramento pra Fm_Teresina/Fm_RioDoRasto.
-    Usado por ajustar_plano_formacao pra estabilizar o ajuste."""
-    poligono, _ = carregar_area_pmp()
+def _num_texto(serie):
+    """Extrai o número de textos tipo "165m"/"299,76" (mesmo tratamento do banco de poços)."""
+    return pd.to_numeric(serie.astype(str).str.replace(",", ".", regex=False).str.extract(r"(-?\d+\.?\d*)")[0], errors="coerce")
+
+
+def carregar_furos_kmz():
+    """Poços do KMZ mais recente `pocos*.kmz` em 2_Banco_de_Dados (exportado do
+    Google Earth: uma pasta por aba da planilha, ExtendedData com as mesmas
+    colunas do banco). Devolve DataFrame com E/N (UTM 22S, a partir de lon/lat),
+    fonte_planilha = nome da aba e origem = 'kmz'; vazio se não houver KMZ."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    from pyproj import Transformer
+    kmz = sorted(AREA_PMP_SHP.parent.glob("pocos*.kmz"), key=lambda q: q.stat().st_mtime, reverse=True)
+    if not kmz:
+        return pd.DataFrame()
+    with zipfile.ZipFile(kmz[0]) as z:
+        raiz = ET.fromstring(z.read(next(n for n in z.namelist() if n.lower().endswith(".kml"))))
+    ns = {"k": "http://www.opengis.net/kml/2.2"}
+    linhas = []
+    for pasta in raiz.iter("{%s}Folder" % ns["k"]):
+        aba = pasta.find("k:name", ns).text
+        for pm in pasta.findall("k:Placemark", ns):
+            c = pm.find(".//k:Point/k:coordinates", ns)
+            if c is None:
+                continue
+            d = {"fonte_planilha": aba, "origem": "kmz"}
+            for dd in pm.iter("{%s}Data" % ns["k"]):
+                v = dd.find("k:value", ns)
+                d[dd.get("name")] = v.text if v is not None else None
+            d["lon"], d["lat"] = [float(v) for v in c.text.split(",")[:2]]
+            linhas.append(d)
+    df = pd.DataFrame(linhas)
+    df["E"], df["N"] = Transformer.from_crs(4326, 31982, always_xy=True).transform(df["lon"].to_numpy(), df["lat"].to_numpy())
+    return df
+
+
+_CACHE_BANCO = {}
+
+
+def _ler_banco_pocos():
+    """Banco de poços já numérico (CSV unificado) + KMZ do usuário por cima: pra
+    poço que casa (<= 30 m) o valor do KMZ preenche/corrige o do CSV (é a edição
+    mais recente do usuário); ponto do KMZ sem par no CSV entra como novo."""
+    if "df" in _CACHE_BANCO:
+        return _CACHE_BANCO["df"].copy()
+    from scipy.spatial import cKDTree
     df = pd.read_csv(CSV_PONTOS)
-    # algumas colunas Alt_topo_* vêm como string (pandas infere isso quando a
-    # coluna tem NaN misturado com valor -- não é erro de dado, só precisa
-    # forçar numérico antes de usar em lstsq)
     for col in df.columns:
         if col.startswith("Alt_topo_") or col in ("E", "N"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         elif col.startswith("Prof_topo_") or col in ("Cota_boca", "Profundidade"):
-            # texto tipo "165m"/"299,76" -- extrai o número (mesmo tratamento do dashboard)
-            df[col] = pd.to_numeric(
-                df[col].astype(str).str.replace(",", ".", regex=False).str.extract(r"(-?\d+\.?\d*)")[0],
-                errors="coerce",
-            )
-    dentro = pontos_dentro_poligono(df["E"].to_numpy(), df["N"].to_numpy(), poligono)
-    return df[dentro].reset_index(drop=True)
+            df[col] = _num_texto(df[col])
+    k = carregar_furos_kmz()
+    if len(k) == 0:
+        _CACHE_BANCO["df"] = df
+        return df.copy()
+    colunas_num = [c for c in k.columns if c.startswith(("Alt_topo_", "Prof_topo_")) or c in ("Cota_boca", "Profundidade")]
+    for col in colunas_num:
+        k[col] = _num_texto(k[col])
+    base = df.dropna(subset=["E", "N"])
+    d, j = cKDTree(np.column_stack([base["E"], base["N"]])).query(np.column_stack([k["E"], k["N"]]))
+    casa = d <= 30
+    n_edit = 0
+    for kk, jj in zip(np.where(casa)[0], j[casa]):
+        idx = base.index[jj]
+        for col in k.columns:
+            if col not in df.columns or not (col in colunas_num or col.startswith("Prof_corpos_") or col in ("Agencia", "Projeto", "Localidade", "Municipio", "UF")):
+                continue   # só as colunas do schema de poços (o KMZ também traz E/N/Altitude etc. com outro tipo)
+            v = k.at[kk, col]
+            if v is None or (isinstance(v, float) and np.isnan(v)) or (isinstance(v, str) and not v.strip()):
+                continue
+            atual = df.at[idx, col]
+            if col in colunas_num:
+                if pd.isna(atual) or abs(float(atual) - float(v)) > 0.01:
+                    df.at[idx, col] = v
+                    n_edit += 1
+            elif str(atual).strip() != str(v).strip():
+                df.at[idx, col] = v
+                n_edit += 1
+    novos = k[~casa].drop(columns=["lon", "lat"], errors="ignore")
+    novos = novos[[c for c in novos.columns if c in df.columns]]
+    print(f"[info] KMZ de poços: {int(casa.sum())} casam com o banco ({n_edit} valores preenchidos/atualizados), {len(novos)} pontos novos")
+    df = pd.concat([df, novos], ignore_index=True)
+    _CACHE_BANCO["df"] = df
+    return df.copy()
+
+
+def carregar_furos_recorte(dominio=None):
+    """Furos/sondagens (banco unificado + KMZ do usuário) dentro do domínio:
+    None = polígono area2.shp (padrão: cubo/mapa/dashboard); uma tupla
+    (e_min, n_min, e_max, n_max) = retângulo (domínio ampliado das seções).
+    Dão a medida DIRETA do topo das formações (sem depender da suposição
+    "terreno no afloramento = topo da formação") -- usados no ajuste dos planos."""
+    df = _ler_banco_pocos()
+    x, y = df["E"].to_numpy(float), df["N"].to_numpy(float)
+    ok = ~np.isnan(x) & ~np.isnan(y)
+    if dominio is None:
+        poligono, _ = carregar_area_pmp()
+        dentro = pontos_dentro_poligono(np.nan_to_num(x, nan=0), np.nan_to_num(y, nan=0), poligono)
+    else:
+        e0, n0, e1, n1 = dominio
+        dentro = (x >= e0) & (x <= e1) & (y >= n0) & (y <= n1)
+    return df[dentro & ok].reset_index(drop=True)
 
 
 # coluna Alt_topo_* do banco de poços regional (schema mais antigo/mais
@@ -366,7 +447,7 @@ def calcular_planos_estilizados(litologia_gdf, interp_terreno, furos=None):
     Compartilhado entre o cubo e a seção -- os dois precisam dos MESMOS
     planos pra ficarem consistentes entre si."""
     if furos is None:
-        furos = carregar_furos_recorte()
+        furos = carregar_furos_recorte(dominio=dominio_secoes())   # domínio ampliado (seções): mais furos pra ancorar os planos
 
     dados = {}
     for unidade in UNIDADES_ESTILIZADO:
@@ -1025,12 +1106,12 @@ def _intervalos_corpo(s):
     return [(float(a), float(b)) for a, b in re.findall(r"\(([\d.]+)\s*,\s*([\d.]+)\)", str(s))]
 
 
-def preparar_furos():
+def preparar_furos(dominio=None):
     """Furos dentro do retângulo como DataFrame pronto pra tabela/mapa/gráficos:
     id, nome, unidade mais profunda atingida (rótulo/cor), corpo intrusivo
     (intervalo mais espesso -> espessura medida em furo) e lat/lon."""
     from pyproj import Transformer
-    f = carregar_furos_recorte().copy()
+    f = carregar_furos_recorte(dominio=dominio).copy()
     f["id"] = ["F%03d" % i for i in range(len(f))]
 
     def nome_tipo(r):
@@ -1045,6 +1126,8 @@ def preparar_furos():
     nt = f.apply(nome_tipo, axis=1)
     f["nome"] = [x[0] for x in nt]
     f["tipo"] = [x[1] for x in nt]
+    # pontos do KMZ vindos das abas "AFL"/"Meus lugares" são pontos de campo (têm código tipo PCCS-xx mas nenhum dado de sondagem)
+    f.loc[(f["origem"] == "kmz") & f["fonte_planilha"].isin(["AFL", "Meus lugares"]), "tipo"] = "Afloramento"
     # ordem: furos primeiro (nome em ordem natural), depois afloramentos
     f = f.sort_values(["tipo", "nome"], key=lambda c: c.str.lower() if c.name == "nome" else c).reset_index(drop=True)
     f["id"] = ["F%03d" % i for i in range(len(f))]
@@ -1083,17 +1166,18 @@ SATELITE_ZOOM = 14
 SATELITE_RES_M = 23.0  # metros por pixel do raster UTM cacheado
 
 
-def obter_satelite_utm():
-    """Raster RGB uint8 (3, H, W) do satélite no retângulo, em UTM 22S
-    (linha 0 = norte), + (e_min, n_min, e_max, n_max)."""
+def obter_satelite_utm(bounds=None):
+    """Raster RGB uint8 (3, H, W) do satélite no retângulo (area2, ou `bounds`
+    = domínio ampliado), em UTM 22S (linha 0 = norte), + (e_min, n_min, e_max, n_max)."""
     from rasterio.transform import from_bounds
     from rasterio.warp import Resampling, reproject
     from shapely.geometry import box
 
-    _, (e0, n0, e1, n1) = carregar_area_pmp()
+    e0, n0, e1, n1 = bounds if bounds is not None else carregar_area_pmp()[1]
     w_px, h_px = int(round((e1 - e0) / SATELITE_RES_M)), int(round((n1 - n0) / SATELITE_RES_M))
     CACHE_DIR.mkdir(exist_ok=True)
-    cache = CACHE_DIR / f"satelite_z{SATELITE_ZOOM}_{w_px}x{h_px}.npy"
+    cache = (CACHE_DIR / f"satelite_z{SATELITE_ZOOM}_{w_px}x{h_px}_{int(e0)}_{int(n0)}.npy" if bounds is not None
+             else CACHE_DIR / f"satelite_z{SATELITE_ZOOM}_{w_px}x{h_px}.npy")
     if cache.exists():
         return np.load(cache), (e0, n0, e1, n1)
 
@@ -1119,27 +1203,97 @@ def amostrar_satelite_rgb(raster, bounds, xs, ys):
     return np.stack([raster[0, row, col], raster[1, row, col], raster[2, row, col]], axis=-1)
 
 
+def _rotulo_secao(nome):
+    """"A-A'" -> "A" (rótulo curto do botão); sem hífen mantém o texto."""
+    n = str(nome).strip()
+    return n.split("-")[0].strip() or n
+
+
 def carregar_linhas_secao():
-    """Linhas de seção A-D desenhadas pelo usuário em 2_Banco_de_Dados/secao*.shp
-    (polilinhas, coluna 'nome') -> lista de (nome, LineString 2D em UTM 22S), em
-    ordem de nome. Se houver mais de um secao*.shp (secao.shp, secao1.shp...),
-    usa o modificado por último. Linhas sem nome viram 'L1', 'L2'..."""
+    """Linhas de seção desenhadas pelo usuário -> lista de (rótulo, LineString 2D
+    em UTM 22S) ordenada por rótulo. Fonte: o arquivo MAIS RECENTE entre
+    2_Banco_de_Dados/secoes*.kmz (Google Earth, lon/lat; placemarks "A-A'") e
+    secao*.shp (polilinhas com coluna 'nome'). Linhas sem nome viram L1, L2..."""
     import shapely
-    candidatos = sorted(AREA_PMP_SHP.parent.glob("secao*.shp"), key=lambda q: q.stat().st_mtime, reverse=True)
-    if not candidatos:
+    pasta = AREA_PMP_SHP.parent
+    cand = list(pasta.glob("secoes*.kmz")) + list(pasta.glob("secao*.shp"))
+    if not cand:
         return []
-    gdf = gpd.read_file(candidatos[0]).to_crs("EPSG:31982")
+    arq = max(cand, key=lambda q: q.stat().st_mtime)
     linhas = []
-    for i, r in enumerate(gdf.itertuples(), start=1):
-        nome = str(getattr(r, "nome", "") or "").strip() or f"L{i}"
-        geom = shapely.force_2d(r.geometry)
-        if geom.geom_type == "MultiLineString":
-            geom = shapely.line_merge(geom)
-        if geom.geom_type != "LineString":
-            continue
-        linhas.append((nome, geom))
-    print(f"[info] linhas de seção: {', '.join(n for n, _ in sorted(linhas))} (de {candidatos[0].name})")
-    return sorted(linhas, key=lambda t: t[0])
+    if arq.suffix.lower() == ".kmz":
+        import zipfile
+        import xml.etree.ElementTree as ET
+        from pyproj import Transformer
+        t = Transformer.from_crs(4326, 31982, always_xy=True)
+        with zipfile.ZipFile(arq) as z:
+            raiz = ET.fromstring(z.read(next(n for n in z.namelist() if n.lower().endswith(".kml"))))
+        ns = {"k": "http://www.opengis.net/kml/2.2"}
+        for i, pm in enumerate(raiz.iter("{%s}Placemark" % ns["k"]), start=1):
+            c = pm.find(".//k:LineString/k:coordinates", ns)
+            if c is None:
+                continue
+            pts = np.array([[float(v) for v in p.split(",")[:2]] for p in c.text.split()])
+            x, y = t.transform(pts[:, 0], pts[:, 1])
+            nome = pm.find("k:name", ns)
+            linhas.append((_rotulo_secao(nome.text) if nome is not None and nome.text else f"L{i}", shapely.LineString(np.column_stack([x, y]))))
+    else:
+        gdf = gpd.read_file(arq).to_crs("EPSG:31982")
+        for i, r in enumerate(gdf.itertuples(), start=1):
+            nome = str(getattr(r, "nome", "") or "").strip() or f"L{i}"
+            geom = shapely.force_2d(r.geometry)
+            if geom.geom_type == "MultiLineString":
+                geom = shapely.line_merge(geom)
+            if geom.geom_type == "LineString":
+                linhas.append((_rotulo_secao(nome), geom))
+    linhas.sort(key=lambda t: t[0])
+    if not _CACHE_BANCO.get("linhas_log"):
+        print(f"[info] linhas de seção: {', '.join(n for n, _ in linhas)} (de {arq.name})")
+        _CACHE_BANCO["linhas_log"] = True
+    return linhas
+
+
+def dominio_secoes(margem_m=2000.0):
+    """Retângulo (e_min, n_min, e_max, n_max) que cobre a area2 E todas as linhas
+    de seção (+ margem) -- o "domínio ampliado" onde as seções, os planos e os
+    furos das seções são calculados."""
+    e0, n0, e1, n1 = carregar_area_pmp()[1]
+    for _, geom in carregar_linhas_secao():
+        a, b, c, d = geom.bounds
+        e0, n0, e1, n1 = min(e0, a), min(n0, b), max(e1, c), max(n1, d)
+    return (e0 - margem_m, n0 - margem_m, e1 + margem_m, n1 + margem_m)
+
+
+def carregar_vertices_curvas_ext(bounds, passo_m=40.0):
+    """Vértices (x, y, z) da curva de nível REGIONAL (CURVAS.shp, 10 m, EPSG:3857)
+    recortada no retângulo `bounds` (UTM 22S) e desbastada numa grade de `passo_m`
+    -- terreno do domínio ampliado das seções. Dentro da area2 é idêntico a
+    curvas3.shp (conferido: diferença 0 m), então não há emenda."""
+    import pyogrio
+    from shapely.geometry import box
+    chave = f"curvasext_{int(bounds[0])}_{int(bounds[1])}_{int(bounds[2])}_{int(bounds[3])}_{int(passo_m)}_{CURVAS_SHP.stat().st_size}"
+    cache = CACHE_DIR / f"{chave}.npz"
+    if cache.exists():
+        d = np.load(cache)
+        return d["xs"], d["ys"], d["zs"]
+    pad = 3000.0
+    b3857 = gpd.GeoSeries([box(bounds[0] - pad, bounds[1] - pad, bounds[2] + pad, bounds[3] + pad)], crs=31982).to_crs(3857).total_bounds
+    g = pyogrio.read_dataframe(CURVAS_SHP, bbox=tuple(b3857), columns=["ELEV"]).to_crs("EPSG:31982")
+    c = g.get_coordinates()
+    xs, ys, zs = c["x"].to_numpy(), c["y"].to_numpy(), g["ELEV"].reindex(c.index).to_numpy()
+    # o bbox do pyogrio traz a feição INTEIRA (contornos de dezenas de km) -- corta os vértices no retângulo + folga
+    dentro = (xs >= bounds[0] - pad) & (xs <= bounds[2] + pad) & (ys >= bounds[1] - pad) & (ys <= bounds[3] + pad)
+    xs, ys, zs = xs[dentro], ys[dentro], zs[dentro]
+    cel = np.floor(xs / passo_m).astype(np.int64) * 10_000_000 + np.floor(ys / passo_m).astype(np.int64)
+    ordem = np.argsort(cel, kind="stable")
+    ids = cel[ordem]
+    manter = np.ones(len(ids), dtype=bool)
+    manter[1:] = ids[1:] != ids[:-1]
+    idx = ordem[manter]
+    print(f"[info] terreno ampliado: {len(xs):,} vértices regionais -> {len(idx):,} (grade {passo_m:.0f} m)")
+    CACHE_DIR.mkdir(exist_ok=True)
+    np.savez_compressed(cache, xs=xs[idx], ys=ys[idx], zs=zs[idx])
+    return xs[idx], ys[idx], zs[idx]
 
 
 # =====================================================================
