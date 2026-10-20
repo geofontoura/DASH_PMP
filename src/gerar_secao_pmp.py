@@ -578,7 +578,27 @@ POST_JS = r"""
         marcarSecao(null);
         Plotly.relayout(gd, {'xaxis2.range': [0, C.angulos[anguloAtual].compKm]});
     }
-    function reescalarY() { return Plotly.relayout(gd, {'yaxis2.autorange': true}); }   // o animate não reajusta o eixo Y sozinho
+    // Exagero vertical do perfil: 0 = "auto" (o eixo Y preenche a altura); >0 = escala real x N (1 = sem exagero,
+    // 1 km no eixo X = 1000 m no Y). Calcula o intervalo do Y a partir das dimensões em pixels do gráfico, centrado nos dados.
+    var ve = 0;
+    function aplicarExagero() {
+        return Plotly.relayout(gd, {'yaxis2.autorange': true}).then(function() {
+            var f0 = gd._fullLayout;
+            if (ve === 0) {   // mostra qual exagero o modo auto está dando
+                var q = (f0.yaxis2._length / (f0.yaxis2.range[1] - f0.yaxis2.range[0])) / (f0.xaxis2._length / ((f0.xaxis2.range[1] - f0.xaxis2.range[0]) * 1000));
+                labVe.textContent = 'auto (~' + Math.round(q) + '×)'; return;
+            }
+            var fl = gd._fullLayout, r = fl.yaxis2.range, c = (r[0] + r[1]) / 2, xr = fl.xaxis2.range;
+            var span = (fl.yaxis2._length / fl.xaxis2._length) * (xr[1] - xr[0]) * 1000 / ve;
+            return Plotly.relayout(gd, {'yaxis2.range': [c - span / 2, c + span / 2]});
+        });
+    }
+    function reescalarY() { return aplicarExagero(); }   // o animate não reajusta o eixo Y sozinho
+    var slVe = document.getElementById('exag-ve'), labVe = document.getElementById('exag-val');
+    slVe.addEventListener('input', function() {
+        ve = +slVe.value; labVe.textContent = ve === 0 ? 'auto' : ve + '×'; aplicarExagero().catch(function() {});
+    });
+    window.addEventListener('resize', function() { setTimeout(function() { aplicarExagero().catch(function() {}); }, 250); });
     function irPara(a, p) {
         anguloAtual = a; posAtual = p; sl.value = p; lab.textContent = rotulo(a, p);
         Plotly.animate(gd, [a + '_' + p], OPT).then(reescalarY).catch(function() {});
@@ -688,6 +708,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   input[type=range] { accent-color: @@ROXO@@; width: 280px; }
   .btn-secao { min-width: 34px; font-weight: 700; padding: 5px 11px; }
   input[type=range].apagado { opacity: .4; }
+  #exag-val { min-width: 74px; font-variant-numeric: tabular-nums; font-weight: 600; }
   #corte-val { min-width: 62px; font-variant-numeric: tabular-nums; font-weight: 600; }
   #legenda { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; padding: 8px 20px 10px; font-size: 11.5px; flex-shrink: 0; border-bottom: 1px solid var(--borda); }
   .leg-item, .leg-fixo { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
@@ -712,6 +733,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   <div class="grupo"><span class="rot">Seções</span>@@BOTOES_SECAO@@</div>
   <div class="grupo"><span class="rot">Furos</span><button class="btn ativo" id="b-furos">Furos: ON</button></div>
   <div class="grupo"><span class="rot">Posição do corte</span><input type="range" id="corte-pos" min="0" max="@@NPOS@@" step="1" value="@@P0@@"><span id="corte-val"></span><span style="opacity:.55">ou clique no mapa</span></div>
+  <div class="grupo"><span class="rot">Exagero vertical</span><input type="range" id="exag-ve" min="0" max="30" step="1" value="0" style="width:150px"><span id="exag-val">auto</span></div>
   <div class="grupo"><span class="rot">Tema</span><button class="btn ativo" data-tema="escuro">Escuro</button><button class="btn" data-tema="claro">Claro</button></div>
 </div>
 <div id="legenda">@@LEGENDA@@<span class="leg-sep">Furos:</span>@@FUROS_LEG@@</div>
