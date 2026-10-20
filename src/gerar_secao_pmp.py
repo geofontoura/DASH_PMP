@@ -189,10 +189,12 @@ def furos_na_polilinha(F, linha, terr=None):
     perfil é o comprimento ao longo da linha até a projeção do furo, e o
     critério de inclusão é a distância perpendicular à polilinha."""
     n_cls = len(NOMES_CLASSES_FURO)
-    cls = [([], [], []) for _ in range(n_cls)]
-    lab = ([], [], [])   # rótulo (código do furo) na base de cada coluna
+    # dois grupos: "S" = furos que interceptaram corpo intrusivo (sill visto em furo), "N" = os demais --
+    # separados em traços diferentes pro botão "só furos com sill" poder escondê-los sem recalcular nada
+    G = {g: dict(cls=[([], [], []) for _ in range(n_cls)], lab=([], [], [])) for g in ("S", "N")}
     sub = ([], [], [])   # sills só vistos em furo, estendidos LARGURA_SUB_KM pra cada lado
     for i in range(len(F["x"])):
+        cls, lab = (G["S"] if F["corpos"][i] else G["N"]).values()
         pt = shapely.Point(F["x"][i], F["y"][i])
         if linha.distance(pt) > BUFFER_FUROS_M:
             continue
@@ -214,8 +216,10 @@ def furos_na_polilinha(F, linha, terr=None):
         fundo = max([f for _, f, _ in F["segs"][i]] + [b for _, b in F["corpos"][i]], default=None)
         if fundo is not None:
             lab[0].append(d); lab[1].append(round(min(z0 - fundo, zt), 1)); lab[2].append(nome)
-    base = ([v for c in cls for v in c[0]], [v for c in cls for v in c[1]], [None] * sum(len(c[0]) for c in cls))
-    return dict(base=base, cls=cls, lab=lab, sub=sub)
+    for g in G.values():
+        cl = g["cls"]
+        g["base"] = ([v for c in cl for v in c[0]], [v for c in cl for v in c[1]], [None] * sum(len(c[0]) for c in cl))
+    return dict(g=G, sub=sub)
 
 
 def secao_na_polilinha(linha, interp_terreno, planos, sills, furos):
@@ -306,59 +310,57 @@ def main():
                               line=dict(color="#E8A33D", width=2), name="Terreno real", showlegend=False,
                               hovertemplate="Terreno real<extra></extra>"))
 
-    # furos no perfil: contorno preto + 1 traço colorido por classe (unidade / sem topos / corpo intrusivo)
-    fb = inicial["furos"]["base"]
+    # furos no perfil: contorno preto + 1 traço colorido por classe (unidade / sem topos / corpo intrusivo), em 2 grupos
     sb = inicial["furos"]["sub"]
     idx_sub = len(fig.data)
     fig.add_trace(go.Scatter(x=sb[0], y=sb[1], text=sb[2], mode="lines", fill="toself", fillcolor="rgba(230,57,70,0.55)",
                               line=dict(color="#E63946", width=1), name="Sill em subsuperfície (furos)", showlegend=False,
                               hoveron="fills", hovertemplate="%{text}<extra></extra>"))
-    idx_furos_base = len(fig.data)
-    fig.add_trace(go.Scatter(x=fb[0], y=fb[1], mode="lines", line=dict(color="black", width=9), name="Furos",
-                              showlegend=False, hoverinfo="skip"))
-    idx_furos_cls = []
-    for k, (nome_k, cor_k) in enumerate(zip(NOMES_CLASSES_FURO, CORES_CLASSES_FURO)):
-        cx_, cy_, ct_ = inicial["furos"]["cls"][k]
-        idx_furos_cls.append(len(fig.data))
-        fig.add_trace(go.Scatter(x=cx_, y=cy_, text=ct_, mode="lines", line=dict(color=cor_k, width=5 if k < len(NOMES_CLASSES_FURO) - 1 else 7),
-                                  name=f"Furo · {nome_k}", showlegend=False, hovertemplate="%{text}<extra></extra>"))
-
-    # código do furo na base de cada coluna, com buffer branco (halo via CSS: .textpoint text { stroke: white })
-    lb = inicial["furos"]["lab"]
-    idx_furos_rot = len(fig.data)
-    fig.add_trace(go.Scatter(x=lb[0], y=lb[1], text=lb[2], mode="text", textposition="bottom center",
-                              textfont=dict(size=9, color=MARCA_NAVY, family=MARCA_FONTE), name="Códigos dos furos",
-                              showlegend=False, hoverinfo="skip", cliponaxis=True))
-    idx_traces_frame = ([idx_bandas[u] for u in UNIDADES_ESTILIZADO]
-                        + [idx_sill, idx_terreno_perfil, idx_sub, idx_furos_base] + idx_furos_cls + [idx_furos_rot])
+    idx_g = {"S": [], "N": []}   # índices dos traços de cada grupo de furos
+    ordem_furos = []             # (grupo, tipo) na ordem dos traços, pra montar os frames
+    for g in ("S", "N"):
+        gd_ = inicial["furos"]["g"][g]
+        idx_g[g].append(len(fig.data)); ordem_furos.append((g, "base"))
+        fig.add_trace(go.Scatter(x=gd_["base"][0], y=gd_["base"][1], mode="lines", line=dict(color="black", width=9), name="Furos",
+                                  showlegend=False, hoverinfo="skip"))
+        for k, (nome_k, cor_k) in enumerate(zip(NOMES_CLASSES_FURO, CORES_CLASSES_FURO)):
+            cx_, cy_, ct_ = gd_["cls"][k]
+            idx_g[g].append(len(fig.data)); ordem_furos.append((g, k))
+            fig.add_trace(go.Scatter(x=cx_, y=cy_, text=ct_, mode="lines", line=dict(color=cor_k, width=5 if k < len(NOMES_CLASSES_FURO) - 1 else 7),
+                                      name=f"Furo · {nome_k}", showlegend=False, hovertemplate="%{text}<extra></extra>"))
+        # código do furo na base de cada coluna, com buffer branco (halo via CSS: .textpoint text { stroke: white })
+        lb = gd_["lab"]
+        idx_g[g].append(len(fig.data)); ordem_furos.append((g, "lab"))
+        fig.add_trace(go.Scatter(x=lb[0], y=lb[1], text=lb[2], mode="text", textposition="bottom center",
+                                  textfont=dict(size=9, color=MARCA_NAVY, family=MARCA_FONTE), name="Códigos dos furos",
+                                  showlegend=False, hoverinfo="skip", cliponaxis=True))
+    idx_traces_frame = ([idx_bandas[u] for u in UNIDADES_ESTILIZADO] + [idx_sill, idx_terreno_perfil, idx_sub]
+                        + idx_g["S"] + idx_g["N"])
 
     comprimento0_km = secoes_fixas[0]["compKm"]
     fig.update_xaxes(title_text="Distância ao longo da seção (km)", range=[0, comprimento0_km], autorange=False)
     fig.update_yaxes(title_text="Altitude (m)")
 
-    ordem_frame = (UNIDADES_ESTILIZADO + ["sill", "terreno", "sub", "furos_base"]
-                   + [f"furos_{k}" for k in range(len(NOMES_CLASSES_FURO))] + ["rotulos"])
     def montar_dados_frame(secao):
         dados = []
-        for chave in ordem_frame:
-            text = None
-            if chave == "terreno":
-                x, y = secao["terreno"]
-            elif chave == "sill":
-                x, y = secao["sill"]
-            elif chave == "furos_base":
-                x, y, _ = secao["furos"]["base"]
-            elif chave == "sub":
-                x, y, text = secao["furos"]["sub"]
-                dados.append(go.Scatter(x=x, y=y, text=text)); continue
-            elif chave == "rotulos":
-                x, y, text = secao["furos"]["lab"]
-                dados.append(go.Scatter(x=x, y=y, text=text)); continue
-            elif chave.startswith("furos_"):
-                x, y, text = secao["furos"]["cls"][int(chave.split("_")[1])]
+        for u in UNIDADES_ESTILIZADO:
+            x, y = secao["bandas"][u]
+            dados.append(go.Scatter(x=x, y=y))
+        dados.append(go.Scatter(x=secao["sill"][0], y=secao["sill"][1]))
+        dados.append(go.Scatter(x=secao["terreno"][0], y=secao["terreno"][1]))
+        x, y, text = secao["furos"]["sub"]
+        dados.append(go.Scatter(x=x, y=y, text=text))
+        for g, tipo in ordem_furos:
+            gg = secao["furos"]["g"][g]
+            if tipo == "base":
+                x, y, _ = gg["base"]
+                dados.append(go.Scatter(x=x, y=y))
+            elif tipo == "lab":
+                x, y, text = gg["lab"]
+                dados.append(go.Scatter(x=x, y=y, text=text))
             else:
-                x, y = secao["bandas"][chave]
-            dados.append(go.Scatter(x=x, y=y, text=text) if text is not None else go.Scatter(x=x, y=y))
+                x, y, text = gg["cls"][tipo]
+                dados.append(go.Scatter(x=x, y=y, text=text))
         return dados
 
     frames = []
@@ -383,7 +385,7 @@ def main():
            dict(nome="Terreno real", cor="#E8A33D", idx=[idx_terreno_perfil], lito=False)]
     )
     cfg = dict(
-        idxFuros=[idx_furos_base] + idx_furos_cls + [idx_furos_rot], ve0=EXAGERO_INICIAL,
+        idxFuros=idx_g["S"] + idx_g["N"], idxFurosSemSill=idx_g["N"], ve0=EXAGERO_INICIAL,
         temas=dict(escuro=dict(paper=tema_escuro()["paper_bgcolor"], plot=tema_escuro()["plot_bgcolor"], font=tema_escuro()["font_color"],
                                grid=tema_escuro()["grid_color"], axis=tema_escuro()["axis_color"]),
                    claro=dict(paper=tema_claro()["paper_bgcolor"], plot=tema_claro()["plot_bgcolor"], font=tema_claro()["font_color"],
@@ -420,7 +422,7 @@ POST_JS = r"""
 (function() {
     var C = @@CFG@@;
     var gd = document.getElementById('secao');
-    var furosOn = true, atual = 0;
+    var furosOn = true, soSill = false, atual = 0;
     var lab = document.getElementById('corte-val');
     var botoesSecao = document.querySelectorAll('.btn-secao');
     var OPT = {mode: 'immediate', frame: {duration: 0, redraw: true}, transition: {duration: 0}};
@@ -457,10 +459,19 @@ POST_JS = r"""
     botoesSecao.forEach(function(b) { b.addEventListener('click', function() { irSecao(+b.getAttribute('data-i')); }); });
 
     // furos ON/OFF
-    var bF = document.getElementById('b-furos');
+    var bF = document.getElementById('b-furos'), bS = document.getElementById('b-sill');
+    // furosOn liga/desliga todos os furos; soSill (filtro) esconde os furos SEM corpo intrusivo e deixa só os que têm sill medido
+    function aplicarFuros() {
+        var sem = {}; C.idxFurosSemSill.forEach(function(i) { sem[i] = true; });
+        var com = C.idxFuros.filter(function(i) { return !sem[i]; });
+        Plotly.restyle(gd, {visible: furosOn}, com);
+        Plotly.restyle(gd, {visible: furosOn && !soSill}, C.idxFurosSemSill);
+    }
     bF.addEventListener('click', function() {
-        furosOn = !furosOn; bF.classList.toggle('ativo', furosOn); bF.textContent = 'Furos: ' + (furosOn ? 'ON' : 'OFF');
-        Plotly.restyle(gd, {visible: furosOn}, C.idxFuros);
+        furosOn = !furosOn; bF.classList.toggle('ativo', furosOn); bF.textContent = 'Furos: ' + (furosOn ? 'ON' : 'OFF'); aplicarFuros();
+    });
+    bS.addEventListener('click', function() {
+        soSill = !soSill; bS.classList.toggle('ativo', soSill); bS.textContent = 'Só furos com sill: ' + (soSill ? 'ON' : 'OFF'); aplicarFuros();
     });
 
     // legenda clicável (liga/desliga cada camada do perfil)
@@ -563,7 +574,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 <div id="barra">
   <div class="grupo"><span class="rot">Seções</span>@@BOTOES_SECAO@@</div>
   <div class="grupo"><span class="rot">Litologias</span><button class="btn ativo" id="b-lito">Litologias: ON</button></div>
-  <div class="grupo"><span class="rot">Furos</span><button class="btn ativo" id="b-furos">Furos: ON</button></div>
+  <div class="grupo"><span class="rot">Furos</span><button class="btn ativo" id="b-furos">Furos: ON</button><button class="btn" id="b-sill" title="Esconde os furos que não interceptaram corpo intrusivo (sill)">Só furos com sill: OFF</button></div>
   <div class="grupo"><span id="corte-val"></span></div>
   <div class="grupo"><span class="rot">Exagero vertical</span><input type="range" id="exag-ve" min="0" max="30" step="0.5" value="@@VE0@@" style="width:170px"><span id="exag-val"></span></div>
   <div class="grupo"><span class="rot">Tema</span><button class="btn ativo" data-tema="escuro">Escuro</button><button class="btn" data-tema="claro">Claro</button></div>
