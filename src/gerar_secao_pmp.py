@@ -351,7 +351,7 @@ def main():
     print(f"[info] seções fixas: " + ", ".join(f"{d['nome']} ({d['compKm']:.1f} km)" for d in secoes_fixas))
 
     # --- figura: mapa (row1,col1) + perfil (row1,col2) ---
-    fig = make_subplots(rows=1, cols=2, column_widths=[0.34, 0.66], horizontal_spacing=0.05)
+    fig = make_subplots(rows=1, cols=2, column_widths=[0.2, 0.8], horizontal_spacing=0.045)   # mapa estreito (domínio alto e magro) colado no canto, perfil com o resto
 
     fig.add_trace(go.Heatmap(x=mx[0, :], y=my[:, 0], z=mz, colorscale="YlOrBr_r", showscale=False, hoverinfo="none"), row=1, col=1)
 
@@ -368,7 +368,7 @@ def main():
 
     adicionar_escala_e_norte(fig, e_min, e_max, n_min, n_max, row=1, col=1, xref="x", yref="y", comprimento_km=5.0)
     fig.update_xaxes(showticklabels=False, row=1, col=1, range=[e_min, e_max], autorange=False, scaleanchor="y", scaleratio=1, constrain="domain")
-    fig.update_yaxes(showticklabels=False, row=1, col=1, range=[n_min, n_max], autorange=False)
+    fig.update_yaxes(showticklabels=False, row=1, col=1, range=[n_min, n_max], autorange=False, constrain="domain")   # os dois eixos encolhem o domínio (senão o Y se estica e o mapa vira uma faixa)
 
     idx_furos_mapa = len(fig.data)
     fig.add_trace(go.Scatter(
@@ -487,7 +487,7 @@ def main():
     fig.update_layout(
         paper_bgcolor=tema["paper_bgcolor"], plot_bgcolor=tema["plot_bgcolor"],
         font=dict(family=MARCA_FONTE, color=tema["font_color"]), showlegend=False,
-        margin=dict(l=62, r=14, t=10, b=48),
+        margin=dict(l=4, r=10, t=10, b=48),
         images=[dict(source=sat_uri, xref="x", yref="y", x=e_min, y=n_max, sizex=e_max - e_min, sizey=n_max - n_min,
                      xanchor="left", yanchor="top", sizing="stretch", layer="below", opacity=1, visible=False)],
     )
