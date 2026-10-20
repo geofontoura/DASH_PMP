@@ -42,14 +42,18 @@ from _comum_pmp import (
     carregar_sills_individualizados, espessuras_sills, construir_interpolador, avaliar_interpolador,
     pontos_dentro_poligono, calcular_planos_estilizados, calcular_contatos_estilizados,
     obter_satelite_utm, amostrar_satelite_rgb, preparar_furos, _intervalos_corpo, _hex_rgb,
-    LEAFLET_LINKS,
+    LEAFLET_LINKS, dominio_secoes, carregar_vertices_curvas_ext, carregar_linhas_secao, plano_z, sills_nos_pontos,
 )
+import shapely
 
 BASE = Path(__file__).resolve().parent
 OUT_HTML = BASE / "cubo_pmp.html"
 PLOTLY_CDN = f"https://cdn.plot.ly/plotly-{__import__('plotly').offline.get_plotlyjs_version()}.min.js"
 
-N = 130                 # grade do terreno/contatos (nós por eixo)
+NX = 120                # grade do terreno/contatos: nós em E (em N proporcional ao domínio)
+N_CORTINA = 320         # amostras ao longo de cada seção (cortina 3D)
+ESPESSURA_CORTINA_BASE_M = 200.0   # a última formação da cortina (Taciba) é cortada 200 m abaixo do seu topo estrutural (plano reto, como no perfil 2D)
+OFFSET_CORTINA_M = 3.0  # cortina sobe 3 m (topo da 1ª faixa não some sob o terreno)
 PASSO_SILL_M = 100.0    # espaçamento da grade de cada sill (m)
 MAX_NOS_SILL = 110
 OFFSET_TERRENO_M = 2.0  # terreno "flutua" 2 m sobre o topo das formações expostas (evita z-fighting)
@@ -82,18 +86,20 @@ def cores_geologia(grid_e, grid_n, litologia):
 
 
 def montar_dados():
-    poligono, (e0, n0, e1, n1) = carregar_area_pmp()
-    xt, yt, zt = carregar_vertices_curvas_pmp()
+    bounds = dominio_secoes()   # area2 + todas as linhas de seção (+ margem): o bloco cobre as seções inteiras
+    e0, n0, e1, n1 = bounds
+    xt, yt, zt = carregar_vertices_curvas_ext(bounds)
     interp_terreno = construir_interpolador(xt, yt, zt)
     litologia = carregar_litologia_pmp()
 
-    xs = np.linspace(e0, e1, N)
-    ys = np.linspace(n0, n1, N)
+    NY = int(round(NX * (n1 - n0) / (e1 - e0)))
+    xs = np.linspace(e0, e1, NX)
+    ys = np.linspace(n0, n1, NY)
     grid_e, grid_n = np.meshgrid(xs, ys)          # linha 0 = sul
     # raio grande: preenche as bordas sem curva (vizinho mais próximo) pro bloco ficar fechado
     terreno = avaliar_interpolador(interp_terreno, grid_e.ravel(), grid_n.ravel(), raio_mascara_km=60).reshape(grid_e.shape)
     assert not np.isnan(terreno).any()
-    print(f"[info] terreno {np.nanmin(terreno):.0f}-{np.nanmax(terreno):.0f} m, grade {N}x{N}")
+    print(f"[info] terreno {np.nanmin(terreno):.0f}-{np.nanmax(terreno):.0f} m, grade {NX}x{NY} ({(e1 - e0) / 1000:.0f}x{(n1 - n0) / 1000:.0f} km)")
 
     planos = calcular_planos_estilizados(litologia, interp_terreno)
     contatos = calcular_contatos_estilizados(planos, terreno, grid_e, grid_n)
@@ -103,7 +109,7 @@ def montar_dados():
 
     # --- cores do terreno nos 3 modos
     print("[info] cores: hipsometria / geologia / satélite")
-    sat, sat_bounds = obter_satelite_utm()
+    sat, sat_bounds = obter_satelite_utm(bounds)
     cores = {
         "hips": rampa_hipsometrica(terreno),
         "geo": cores_geologia(grid_e, grid_n, litologia),
@@ -132,7 +138,7 @@ def montar_dados():
 
     # --- furos em 3D: colunas ancoradas no terreno do modelo
     furos = []
-    tab = preparar_furos()
+    tab = preparar_furos(dominio=bounds)
     tab = tab[tab["tipo"] == "Furo"]
     idx_unid = {col: k for k, (col, _, _) in enumerate(ORDEM_PROFUNDIDADE_FURO)}
     for _, r in tab.iterrows():
@@ -153,15 +159,38 @@ def montar_dados():
                           tops=tops, corpos=corpos))
     print(f"[info] {len(furos)} furos em 3D, {len(sills)} sills, {len(camadas)} formações")
 
+    # --- seções em 3D (cortinas verticais ao longo de cada linha A-G): terreno, formações (cascata de erosão
+    # com os mesmos planos+correção dos furos do resto do modelo) e sill onde a linha cruza o polígono mapeado
+    cortinas = []
+    for nome_s, linha in carregar_linhas_secao():
+        d_m = np.linspace(0.0, float(linha.length), N_CORTINA)
+        pts = shapely.line_interpolate_point(linha, d_m)
+        px, py = shapely.get_x(pts), shapely.get_y(pts)
+        terr = terr_bilin(np.column_stack([py, px]))
+        corte, tops_c = terr.copy(), []
+        for u in UNIDADES_ESTILIZADO:
+            corte = np.minimum(corte, plano_z(planos, u, px, py))
+            tops_c.append(corte.copy())
+        dentro_s, esp_s = sills_nos_pontos(px, py, carregar_sills_individualizados())
+        cortinas.append(dict(
+            nome=nome_s, comp_km=round(float(linha.length) / 1000, 1),
+            x=b64(px, np.float32), y=b64(py, np.float32), terr=b64(terr, np.float32),
+            tops=[b64(t, np.float32) for t in tops_c],
+            piso=b64(plano_z(planos, UNIDADES_ESTILIZADO[-1], px, py) - ESPESSURA_CORTINA_BASE_M, np.float32),
+            sill_base=b64(np.where(dentro_s, terr - esp_s, np.nan), np.float32),
+            sill_top=b64(np.where(dentro_s, terr, np.nan), np.float32),
+        ))
+    print(f"[info] cortinas 3D: " + ", ".join(f"{c['nome']} ({c['comp_km']} km)" for c in cortinas))
+
     return dict(
-        N=N, xs=[round(float(v), 1) for v in xs], ys=[round(float(v), 1) for v in ys],
+        NX=NX, NY=NY, cortinas=cortinas, xs=[round(float(v), 1) for v in xs], ys=[round(float(v), 1) for v in ys],
         zmin=float(z_piso), zmax=float(np.nanmax(terreno)) + 40, z_piso=z_piso,
         terreno=b64(terreno, np.float32),
         cores={k: b64(v, np.uint8) for k, v in cores.items()},
         camadas=camadas, sills=sills, furos=furos,
         unidades_furo=[dict(n=n_, c=c_) for _, n_, c_ in ORDEM_PROFUNDIDADE_FURO],
         cor_sill=CORES_ESTILIZADO["Gp_SerraGeral"], esp_sill=ESPESSURA_SILL_M,
-        offsets=dict(terreno=OFFSET_TERRENO_M), raio_sub=RAIO_SUB_M,
+        offsets=dict(terreno=OFFSET_TERRENO_M), raio_sub=RAIO_SUB_M, off_cortina=OFFSET_CORTINA_M, raio_furo_secao=1500.0,
     )
 
 
@@ -217,6 +246,8 @@ TEMPLATE = r"""<!DOCTYPE html>
     <button class="btn" id="b-solido">Sólido: OFF</button>
     <button class="btn ativo" id="b-topo">Topografia: ON</button>
     <button class="btn ativo" id="b-furos">Furos: ON</button></div>
+  <div class="grupo"><span class="rot">Seções 3D</span>
+    <button class="btn ativo" id="b-cort">Seções: ON</button>@@BOTOES_CORT@@</div>
   <div class="grupo"><span class="rot">Corte</span>
     <button class="btn" id="b-corte">Corte: OFF</button>
     <select id="corte-dir">
@@ -237,18 +268,22 @@ TEMPLATE = r"""<!DOCTYPE html>
     'use strict';
     var D = @@DATA@@;
     function dec(s, Tipo) { var b = atob(s), u = new Uint8Array(b.length); for (var i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return new Tipo(u.buffer); }
-    var N = D.N, XS = Float64Array.from(D.xs), YS = Float64Array.from(D.ys);
+    var NX = D.NX, NY = D.NY, XS = Float64Array.from(D.xs), YS = Float64Array.from(D.ys);
     var TERR = dec(D.terreno, Float32Array);
     var CORES = { hips: dec(D.cores.hips, Uint8Array), geo: dec(D.cores.geo, Uint8Array), sat: dec(D.cores.sat, Uint8Array) };
     var CAMADAS = D.camadas.map(function(c) { return { nome: c.nome, cor: c.cor, top: dec(c.top, Float32Array) }; });
     var SILLS = D.sills.map(function(s) { return { nome: s.nome, cor: D.cor_sill, xs: Float64Array.from(s.xs), ys: Float64Array.from(s.ys),
                                                  top: dec(s.top, Float32Array), base: dec(s.base, Float32Array) }; });
     var FUROS = D.furos, UNID = D.unidades_furo;
-    var E0 = XS[0], E1 = XS[N - 1], N0 = YS[0], N1 = YS[N - 1];
-    var PISO = new Float32Array(N * N).fill(D.z_piso);
+    var CORT = D.cortinas.map(function(c) { return { nome: c.nome, comp: c.comp_km, x: dec(c.x, Float32Array), y: dec(c.y, Float32Array),
+        terr: dec(c.terr, Float32Array), tops: c.tops.map(function(t) { return dec(t, Float32Array); }),
+        sb: dec(c.sill_base, Float32Array), st: dec(c.sill_top, Float32Array), piso: dec(c.piso, Float32Array) }; });
+    var CORT_ON = {}; CORT.forEach(function(c) { CORT_ON[c.nome] = true; });
+    var E0 = XS[0], E1 = XS[NX - 1], N0 = YS[0], N1 = YS[NY - 1];
+    var PISO = new Float32Array(NX * NY).fill(D.z_piso);
 
     var DIRS = [{ eixo: 'x', inv: false }, { eixo: 'x', inv: true }, { eixo: 'y', inv: false }, { eixo: 'y', inv: true }];
-    var st = { cor: 'hips', solido: false, topo: true, furos: true, corte: false, dir: 0, pos: 35, opac: 1, exag: @@EXAG@@, tema: 'escuro', anim: false };
+    var st = { cor: 'hips', solido: false, topo: true, furos: true, cortinas: true, corte: false, dir: 0, pos: 35, opac: 1, exag: @@EXAG@@, tema: 'escuro', anim: false };
 
     // ------------------------------------------------ recorte de grade (plano de corte)
     function lerp(a, b, t) { return t === 0 ? a : (t === 1 ? b : a + (b - a) * t); }
@@ -340,7 +375,8 @@ TEMPLATE = r"""<!DOCTYPE html>
     var gd = document.getElementById('cubo');
     var IDX = { terreno: 0, camadas: 1, sills: 1 + CAMADAS.length, furos: 1 + CAMADAS.length + SILLS.length };
     var N_FUROS_TR = UNID.length + 2;
-    var IDX_SUB = 1 + CAMADAS.length + SILLS.length + N_FUROS_TR + 1;   // por último: não desloca os outros índices   // 1 por unidade + "sem topos" + "corpo intrusivo"
+    var IDX_SUB = 1 + CAMADAS.length + SILLS.length + N_FUROS_TR + 1;   // por último: não desloca os outros índices
+    var IDX_CORT = IDX_SUB + 1;   // cortinas: 1 malha por formação + sill + contorno do terreno + rótulos   // 1 por unidade + "sem topos" + "corpo intrusivo"
 
     function traceMalha(nome, cor, extra) {
         var t = { type: 'mesh3d', x: [], y: [], z: [], i: [], j: [], k: [], color: cor, name: nome, showlegend: true,
@@ -364,6 +400,10 @@ TEMPLATE = r"""<!DOCTYPE html>
         tr.push({ type: 'scatter3d', mode: 'markers', x: [], y: [], z: [], text: [], hoverinfo: 'text', name: 'Furos de sondagem',
                   legendgroup: 'furos', showlegend: true, marker: { size: 3.5, color: '#FFFFFF', line: { color: '@@NAVY@@', width: 1 } } });
         tr.push(traceMalha('Sills vistos só em furo (±' + Math.round(D.raio_sub) + ' m)', '#E63946', { opacity: 0.9 }));
+        CAMADAS.forEach(function(c) { tr.push(traceMalha(c.nome + ' (seção)', c.cor, { showlegend: false, flatshading: true, lighting: { ambient: 0.95, diffuse: 0.2, specular: 0, roughness: 1, fresnel: 0 } })); });
+        tr.push(traceMalha('Sill (seção)', D.cor_sill, { showlegend: false, flatshading: true, lighting: { ambient: 0.95, diffuse: 0.2, specular: 0, roughness: 1, fresnel: 0 } }));
+        tr.push({ type: 'scatter3d', mode: 'lines', x: [], y: [], z: [], line: { color: '#FFFFFF', width: 5 }, name: 'Terreno na seção', showlegend: false, hoverinfo: 'skip' });
+        tr.push({ type: 'scatter3d', mode: 'text', x: [], y: [], z: [], text: [], textfont: { color: '#FFFFFF', size: 15 }, name: 'Rótulos das seções', showlegend: false, hoverinfo: 'skip' });
         return tr;
     }
     function fmt0(v) { return Math.round(v).toString(); }
@@ -373,12 +413,21 @@ TEMPLATE = r"""<!DOCTYPE html>
         var v = spec.eixo === 'x' ? x : y;
         return spec.inv ? v >= spec.v : v <= spec.v;
     }
+    function pertoCortina(w) {
+        var R2 = D.raio_furo_secao * D.raio_furo_secao, any = false;
+        for (var q = 0; q < CORT.length; q++) {
+            var c = CORT[q]; if (!CORT_ON[c.nome]) continue; any = true;
+            for (var i = 0; i < c.x.length; i += 3) { var dx = c.x[i] - w.x, dy = c.y[i] - w.y; if (dx * dx + dy * dy <= R2) return true; }
+        }
+        return !any;
+    }
     function dadosFuros(spec) {
         var seg = []; for (var q = 0; q < N_FUROS_TR; q++) seg.push({ x: [], y: [], z: [] });
         var mx = [], my = [], mz = [], mt = [];
         function push(t, w, a, b) { t.x.push(w.x, w.x, null); t.y.push(w.y, w.y, null); t.z.push(w.z0 - a, w.z0 - b, null); }
         FUROS.forEach(function(w) {
             if (!mantido(w.x, w.y, spec)) return;
+            if (st.cortinas && !pertoCortina(w)) return;   // com as seções ligadas, só os furos a <= 1,5 km de alguma seção ligada
             for (var t = 0; t < w.tops.length; t++) {
                 var ini = w.tops[t][0], fim = (t + 1 < w.tops.length) ? w.tops[t + 1][0] : ((w.prof !== null && w.prof > ini) ? w.prof : null);
                 if (fim !== null && fim > ini) push(seg[w.tops[t][1]], w, ini, fim);
@@ -427,6 +476,7 @@ TEMPLATE = r"""<!DOCTYPE html>
         for (var u = 0; u < N_FUROS_TR; u++) { fx.push(fu.seg[u].x); fy.push(fu.seg[u].y); fz.push(fu.seg[u].z); fidx.push(IDX.furos + u); }
         Plotly.restyle(gd, { x: fx, y: fy, z: fz }, fidx);
         Plotly.restyle(gd, { x: [fu.m.x], y: [fu.m.y], z: [fu.m.z], text: [fu.m.t] }, [IDX.furos + N_FUROS_TR]);
+        atualizarCortinas(spec);
         var ps = prismasSub(spec);
         Plotly.restyle(gd, { x: [ps.x], y: [ps.y], z: [ps.z], i: [ps.i], j: [ps.j], k: [ps.k] }, [IDX_SUB]);
     }
@@ -436,6 +486,7 @@ TEMPLATE = r"""<!DOCTYPE html>
         var vx = [], vy = [], vz = [], I = [], J = [], K = [], n = 10, R = D.raio_sub;
         FUROS.forEach(function(w) {
             if (!mantido(w.x, w.y, spec)) return;
+            if (st.cortinas && !pertoCortina(w)) return;
             w.corpos.forEach(function(cp) {
                 var zt = w.z0 - cp[0], zb = w.z0 - cp[1], b0 = vx.length, k;
                 for (k = 0; k < n; k++) { var a = 2 * Math.PI * k / n; vx.push(w.x + R * Math.cos(a)); vy.push(w.y + R * Math.sin(a)); vz.push(zb); }
@@ -453,30 +504,75 @@ TEMPLATE = r"""<!DOCTYPE html>
         return { x: Float32Array.from(vx), y: Float32Array.from(vy), z: Float32Array.from(vz), i: Int32Array.from(I), j: Int32Array.from(J), k: Int32Array.from(K) };
     }
 
+    // cortinas 3D das seções: malha vertical por formação (topo = contato erodido, base = contato de baixo; a última vai ao piso)
+    function cortinasDados(spec) {
+        var NF = CAMADAS.length, M = [], k;
+        for (k = 0; k <= NF; k++) M.push({ x: [], y: [], z: [], i: [], j: [], k: [] });   // 0..NF-1 formações, NF = sill
+        var lx = [], ly = [], lz = [], tx = [], ty = [], tz = [], tt = [], dz = D.off_cortina;
+        if (st.cortinas) CORT.forEach(function(c) {
+            if (!CORT_ON[c.nome]) return;
+            var n = c.x.length, i;
+            var ok = []; for (i = 0; i < n; i++) ok.push(mantido(c.x[i], c.y[i], spec));
+            for (k = 0; k <= NF; k++) {
+                var m = M[k], b0 = m.x.length;
+                for (i = 0; i < n; i++) {
+                    var top, base;
+                    if (k < NF) { top = c.tops[k][i]; base = (k + 1 < NF) ? c.tops[k + 1][i] : c.piso[i]; } else { top = c.st[i]; base = c.sb[i]; }
+                    m.x.push(c.x[i], c.x[i]); m.y.push(c.y[i], c.y[i]); m.z.push(top + dz, base + dz);
+                }
+                for (i = 0; i < n - 1; i++) {
+                    if (!ok[i] || !ok[i + 1]) continue;
+                    var a = b0 + 2 * i, b = a + 1, c2 = a + 2, d = a + 3;
+                    var t0 = m.z[a], t1 = m.z[c2], s0 = m.z[b], s1 = m.z[d];
+                    if (!(isFinite(t0) && isFinite(t1) && isFinite(s0) && isFinite(s1))) continue;
+                    if (Math.max(t0 - s0, t1 - s1) < 0.3) continue;
+                    m.i.push(a, b); m.j.push(c2, c2); m.k.push(b, d);
+                }
+            }
+            for (i = 0; i < n; i++) { if (ok[i]) { lx.push(c.x[i]); ly.push(c.y[i]); lz.push(c.terr[i] + dz + 1); } else { lx.push(null); ly.push(null); lz.push(null); } }
+            lx.push(null); ly.push(null); lz.push(null);
+            if (ok[0]) { tx.push(c.x[0]); ty.push(c.y[0]); tz.push(c.terr[0] + dz + 70); tt.push(c.nome); }
+            if (ok[n - 1]) { tx.push(c.x[n - 1]); ty.push(c.y[n - 1]); tz.push(c.terr[n - 1] + dz + 70); tt.push(c.nome + "'"); }
+        });
+        return { M: M, line: { x: lx, y: ly, z: lz }, lab: { x: tx, y: ty, z: tz, t: tt } };
+    }
+    function atualizarCortinas(spec) {
+        var cd = cortinasDados(spec), NF = CAMADAS.length, upd = { x: [], y: [], z: [], i: [], j: [], k: [] }, idx = [], q;
+        cd.M.forEach(function(m, k) { ['x', 'y', 'z', 'i', 'j', 'k'].forEach(function(f) { upd[f].push(m[f]); }); idx.push(IDX_CORT + k); });
+        Plotly.restyle(gd, upd, idx);
+        Plotly.restyle(gd, { x: [cd.line.x], y: [cd.line.y], z: [cd.line.z] }, [IDX_CORT + NF + 1]);
+        Plotly.restyle(gd, { x: [cd.lab.x], y: [cd.lab.y], z: [cd.lab.z], text: [cd.lab.t] }, [IDX_CORT + NF + 2]);
+    }
+
     function visibilidades() {
         Plotly.restyle(gd, { visible: st.topo ? true : 'legendonly' }, [IDX.terreno]);
         var fi = []; for (var u = 0; u <= N_FUROS_TR; u++) fi.push(IDX.furos + u);
         Plotly.restyle(gd, { visible: st.furos ? true : 'legendonly' }, fi);
+        // com as seções ligadas e sem sólido, as superfícies de contato só poluiriam (a cortina já mostra as camadas)
+        var ci = []; CAMADAS.forEach(function(c, i) { ci.push(IDX.camadas + i); });
+        Plotly.restyle(gd, { visible: (st.cortinas && !st.solido) ? 'legendonly' : true }, ci);
     }
     function opacidade() {
-        var idx = [IDX.terreno]; CAMADAS.forEach(function(c, i) { idx.push(IDX.camadas + i); }); SILLS.forEach(function(s, i) { idx.push(IDX.sills + i); });
+        var idx = []; CAMADAS.forEach(function(c, i) { idx.push(IDX.camadas + i); }); SILLS.forEach(function(s, i) { idx.push(IDX.sills + i); });
         Plotly.restyle(gd, { opacity: st.opac }, idx);
+        // terreno translúcido quando as seções estão ligadas (senão a cortina fica escondida debaixo dele)
+        Plotly.restyle(gd, { opacity: st.cortinas ? Math.min(st.opac, 0.4) : st.opac }, [IDX.terreno]);
     }
     function layoutTema() {
         var t = TEMAS[st.tema];
         var ax = function(tit, rng) { return { title: tit, range: rng, color: t.texto, gridcolor: t.grid, zerolinecolor: t.grid, showbackground: false }; };
-        var ext = E1 - E0, R = (D.zmax - D.zmin) / ext * st.exag;
+        var ext = Math.max(E1 - E0, N1 - N0), R = (D.zmax - D.zmin) / ext * st.exag;
         return {
             paper_bgcolor: t.paper, font: { family: '@@FONTE@@', color: t.texto, size: 11 },
             'scene.xaxis': ax('E (UTM 22S)', [E0, E1]), 'scene.yaxis': ax('N (UTM 22S)', [N0, N1]), 'scene.zaxis': ax('Altitude (m)', [D.zmin, D.zmax]),
-            'scene.aspectratio': { x: 1, y: (N1 - N0) / ext, z: Math.min(R, 1.2) },
+            'scene.aspectratio': { x: (E1 - E0) / ext, y: (N1 - N0) / ext, z: Math.min(R, 1.2) },
             'legend.bgcolor': 'rgba(0,0,0,0)', 'legend.font.color': t.texto,
         };
     }
 
     Plotly.newPlot(gd, tracesIniciais(), {
         margin: { l: 0, r: 0, t: 6, b: 0 }, paper_bgcolor: '@@NAVY@@',
-        scene: { aspectmode: 'manual', camera: { eye: { x: 1.25, y: -1.45, z: 0.85 } }, xaxis: {}, yaxis: {}, zaxis: {} },
+        scene: { aspectmode: 'manual', camera: { eye: { x: 0.75, y: -1.0, z: 0.7 }, center: { x: 0, y: 0.04, z: -0.12 } }, xaxis: {}, yaxis: {}, zaxis: {} },
         legend: { x: 0.005, y: 0.99, itemsizing: 'constant', font: { size: 11 } },
     }, { responsive: true, displaylogo: false }).then(function() {
         Plotly.relayout(gd, layoutTema());
@@ -500,9 +596,15 @@ TEMPLATE = r"""<!DOCTYPE html>
             apos();
         });
     }
-    alternar('b-solido', 'solido', 'Sólido', redesenhar);
+    alternar('b-solido', 'solido', 'Sólido', function() { redesenhar(); visibilidades(); });
     alternar('b-topo', 'topo', 'Topografia', visibilidades);
     alternar('b-furos', 'furos', 'Furos', visibilidades);
+    alternar('b-cort', 'cortinas', 'Seções', function() { redesenhar(); visibilidades(); opacidade(); });
+    document.querySelectorAll('.btn-cort').forEach(function(b) {
+        b.addEventListener('click', function() {
+            var n = b.getAttribute('data-n'); CORT_ON[n] = !CORT_ON[n]; b.classList.toggle('ativo', CORT_ON[n]); redesenhar();
+        });
+    });
 
     var bCorte = document.getElementById('b-corte');
     function atualizarCorteUI() {
@@ -554,7 +656,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 def main():
     dados = montar_dados()
     ext = dados["xs"][-1] - dados["xs"][0]
-    exag = 2.5
+    exag = 5.0
     logo = logo_base64()
     html = TEMPLATE
     for token, valor in {
@@ -562,6 +664,7 @@ def main():
         "@@CINZA@@": MARCA_CINZA_CLARO, "@@EXAG@@": str(exag),
         "@@LOGO@@": f'<img src="data:image/jpeg;base64,{logo}" alt="GS Tech">' if logo else "",
         "@@DATA@@": json.dumps(dados, ensure_ascii=False, separators=(",", ":")),
+        "@@BOTOES_CORT@@": "".join(f'<button class="btn btn-cort ativo" data-n="{c["nome"]}" title="Seção {c["nome"]}-{c["nome"]}\' — {c["comp_km"]} km">{c["nome"]}</button>' for c in dados["cortinas"]),
     }.items():
         html = html.replace(token, valor)
     assert "@@" not in html, "token sem substituir"
